@@ -11,7 +11,7 @@ API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 SLEEP_INTERVAL = 30 
 datapoint = MultiHopEval.make_one(
-    n_chars_problem=500000,
+    n_chars_problem=1000000,
     num_queries=1,
     hops=2,
     hash_pair_str_length=16,
