@@ -106,9 +106,32 @@ Key options:
 - `chunk_batch_size`: Chunks per encoding batch
 - `use_gradient_checkpointing`: Memory-efficient training
 
-## Results
+## Benchmark Results
 
-*Coming soon: Benchmark results comparing IMT against baseline approaches.*
+### Baseline: Google Gemini 1.5 Flash
+
+We evaluated Google's `gemini-1.5-flash-exp-0827` model on the 2-hop HashHop task using an 8-shot prompt with Chain of Thought (CoT) reasoning. This represents the baseline performance of a frontier LLM on this benchmark.
+
+| Context Length | Accuracy |
+|----------------|----------|
+| 1K tokens | 100% |
+| 10K tokens | 96% |
+| 100K tokens | 77% |
+| 200K tokens | 37% |
+| 500K tokens | 9% |
+| 1M tokens | 4% |
+
+**Key Observations:**
+- Performance drops sharply beyond 100K tokens
+- Even at 200K tokens, accuracy falls below 40%
+- At 1M tokens (Gemini's extended context), the model achieves only 4% accuracy
+- This highlights the gap between a model's maximum context length and its practical reasoning ability
+
+These results demonstrate that while models may theoretically handle longer contexts, effective long-context reasoning remains an open challenge. The IMT architecture aims to address this by using learned retrieval rather than relying on attention over the full context.
+
+### IMT Results
+
+*Coming soon: Results from trained IMT models.*
 
 ## Acknowledgments
 
