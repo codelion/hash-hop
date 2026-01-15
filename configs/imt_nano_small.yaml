@@ -26,8 +26,8 @@ model:
   dropout: 0.1
   max_hash_length: 20
   use_gradient_checkpointing: true
-  chunk_batch_size: 32
-  memory_limit_fraction: 0.5  # Limit to 50% VRAM to allow other work
+  chunk_batch_size: 16
+  memory_limit_fraction: 0.33  # Limit to ~12GB on 36GB system
 
 training:
   learning_rate: 0.0001
@@ -40,8 +40,8 @@ training:
   save_every: 500
   log_every: 10
 
-  # Data generation - 1M tokens (faster iteration)
-  n_chars_problem: 1000000
+  # Data generation - 100K tokens (faster iteration)
+  n_chars_problem: 100000
   num_queries: 5
   hops: 2
   hash_pair_str_length: 16

@@ -27,7 +27,7 @@ model:
   max_hash_length: 20
   use_gradient_checkpointing: true
   chunk_batch_size: 64
-  memory_limit_fraction: 0.5  # Limit to 50% VRAM to allow other work
+  memory_limit_fraction: 0.33  # Limit to ~12GB on 36GB system
 
 training:
   learning_rate: 0.0001

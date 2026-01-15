@@ -93,7 +93,11 @@ class IMTTrainer:
 
             if total_memory > 0:
                 limit_bytes = int(total_memory * fraction)
-                mx.metal.set_memory_limit(limit_bytes)
+                # Use new API if available, fall back to deprecated one
+                if hasattr(mx, "set_memory_limit"):
+                    mx.set_memory_limit(limit_bytes)
+                else:
+                    mx.metal.set_memory_limit(limit_bytes)
                 print(
                     f"Memory limit set to {fraction*100:.0f}% "
                     f"({limit_bytes / (1024**3):.1f} GB of {total_memory / (1024**3):.1f} GB)"
@@ -327,7 +331,9 @@ class IMTTrainer:
         checkpoint_dir.mkdir(exist_ok=True)
 
         # Save model weights
-        weights = dict(mx.tree_flatten(self.model.parameters()))
+        # Use mlx.utils for tree flattening (API changed in newer versions)
+        from mlx import utils as mlx_utils
+        weights = dict(mlx_utils.tree_flatten(self.model.parameters()))
         mx.save_safetensors(str(checkpoint_dir / "weights.safetensors"), weights)
 
         # Save training state
