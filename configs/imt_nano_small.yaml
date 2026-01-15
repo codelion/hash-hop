@@ -30,7 +30,7 @@ model:
   memory_limit_fraction: 0.33  # Limit to ~12GB on 36GB system
 
 training:
-  learning_rate: 0.0001
+  learning_rate: 0.001  # Increased for faster learning
   weight_decay: 0.01
   warmup_steps: 100
   max_steps: 10000
@@ -47,7 +47,7 @@ training:
   hash_pair_str_length: 16
 
   # Loss weights
-  lambda_retrieval: 0.5
+  lambda_retrieval: 1.0  # Increased to match generation loss scale
   lambda_regularization: 0.01
 
   # Output

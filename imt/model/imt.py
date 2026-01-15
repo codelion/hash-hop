@@ -112,7 +112,7 @@ class IndexedMemoryTransformer(nn.Module):
         self,
         query_tokens: mx.array,
         index: Dict[str, Any],
-    ) -> Tuple[mx.array, mx.array, mx.array]:
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
         """Process queries against the index.
 
         Args:
@@ -123,26 +123,27 @@ class IndexedMemoryTransformer(nn.Module):
             logits: Output logits of shape (batch, query_len, vocab_size).
             retrieval_scores: Retrieval scores of shape (batch, top_k).
             chunk_indices: Retrieved chunk indices of shape (batch, top_k).
+            all_chunk_scores: Scores for ALL chunks (batch, num_chunks) for supervision.
         """
         # Initial query embedding for retrieval
         query_repr = self.decoder.get_query_representation(query_tokens)
 
         # Retrieve relevant chunks
-        retrieved_hidden, retrieval_scores, chunk_indices = self.index_search.search(
-            query_repr, index
+        retrieved_hidden, retrieval_scores, chunk_indices, all_chunk_scores = (
+            self.index_search.search(query_repr, index)
         )
 
         # Decode answer
         logits, _ = self.decoder(query_tokens, retrieved_hidden, retrieval_scores)
 
-        return logits, retrieval_scores, chunk_indices
+        return logits, retrieval_scores, chunk_indices, all_chunk_scores
 
     def __call__(
         self,
         chunk_tokens: mx.array,
         query_tokens: mx.array,
         precomputed_index: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
         """Full forward pass.
 
         If precomputed_index is provided, skip encoding phase.
@@ -157,6 +158,7 @@ class IndexedMemoryTransformer(nn.Module):
             retrieval_scores: Retrieval scores of shape (batch, top_k).
             chunk_indices: Retrieved chunk indices of shape (batch, top_k).
             index_keys: Index keys of shape (num_chunks, keys_per_chunk, index_dim).
+            all_chunk_scores: Scores for ALL chunks (batch, num_chunks) for supervision.
         """
         if precomputed_index is None:
             # Encode and index
@@ -167,9 +169,11 @@ class IndexedMemoryTransformer(nn.Module):
             index_keys = index["keys"]
 
         # Process queries
-        logits, retrieval_scores, chunk_indices = self.forward_query(query_tokens, index)
+        logits, retrieval_scores, chunk_indices, all_chunk_scores = self.forward_query(
+            query_tokens, index
+        )
 
-        return logits, retrieval_scores, chunk_indices, index_keys
+        return logits, retrieval_scores, chunk_indices, index_keys, all_chunk_scores
 
     def count_parameters(self) -> int:
         """Count total number of trainable parameters.

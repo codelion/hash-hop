@@ -45,21 +45,38 @@ def compute_retrieval_loss(
     retrieval_scores: mx.array,
     chunk_indices: mx.array,
     target_chunk_indices: mx.array,
+    all_chunk_scores: mx.array = None,
 ) -> mx.array:
     """Loss to encourage retrieving correct chunks.
 
-    Uses a contrastive-style loss: maximize score of correct chunk,
-    minimize scores of incorrect chunks.
+    Uses cross-entropy over ALL chunk scores when available (preferred),
+    otherwise falls back to margin loss over retrieved chunks.
 
     Args:
         retrieval_scores: Scores of shape (batch, top_k).
         chunk_indices: Retrieved chunk indices of shape (batch, top_k).
         target_chunk_indices: Ground truth chunk indices of shape (batch,).
+        all_chunk_scores: Optional scores for ALL chunks of shape (batch, num_chunks).
+            When provided, uses cross-entropy loss for direct supervision.
 
     Returns:
         Scalar loss value.
     """
-    # Check if target chunk is in retrieved chunks
+    if all_chunk_scores is not None:
+        # PREFERRED: Cross-entropy loss over all chunks
+        # This provides gradient signal even when target isn't in top-k
+        batch_size, num_chunks = all_chunk_scores.shape
+
+        # Softmax over all chunks to get probabilities
+        log_probs = mx.log(mx.softmax(all_chunk_scores, axis=-1) + 1e-10)
+
+        # Gather log prob for target chunk
+        batch_indices = mx.arange(batch_size)
+        target_log_probs = log_probs[batch_indices, target_chunk_indices]
+
+        return -mx.mean(target_log_probs)
+
+    # Fallback: margin loss over retrieved chunks only
     target_expanded = target_chunk_indices[:, None]  # (batch, 1)
     is_target = (chunk_indices == target_expanded).astype(mx.float32)  # (batch, top_k)
 
@@ -131,6 +148,7 @@ def compute_total_loss(
     pad_id: int = 0,
     lambda_retrieval: float = 0.5,
     lambda_reg: float = 0.01,
+    all_chunk_scores: mx.array = None,
 ) -> Tuple[mx.array, Dict[str, float]]:
     """Compute total loss with all components.
 
@@ -145,13 +163,16 @@ def compute_total_loss(
         pad_id: Padding token ID.
         lambda_retrieval: Weight for retrieval loss.
         lambda_reg: Weight for regularization loss.
+        all_chunk_scores: Optional scores for ALL chunks for direct supervision.
 
     Returns:
         total_loss: Scalar loss for optimization.
         metrics: Dictionary of individual loss components.
     """
     gen_loss = compute_generation_loss(logits, targets, pad_id)
-    ret_loss = compute_retrieval_loss(retrieval_scores, chunk_indices, target_chunk_indices)
+    ret_loss = compute_retrieval_loss(
+        retrieval_scores, chunk_indices, target_chunk_indices, all_chunk_scores
+    )
     reg_loss = compute_index_regularization(index_keys, centroids)
 
     total = gen_loss + lambda_retrieval * ret_loss + lambda_reg * reg_loss

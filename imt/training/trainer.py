@@ -129,12 +129,12 @@ class IMTTrainer:
             Tuple of (loss, metrics_dict).
         """
         # Forward pass
-        logits, retrieval_scores, chunk_indices, index_keys = model(
+        logits, retrieval_scores, chunk_indices, index_keys, all_chunk_scores = model(
             sample.chunk_tokens,
             sample.query_tokens,
         )
 
-        # Compute loss
+        # Compute loss (with all_chunk_scores for proper retrieval supervision)
         loss, metrics = compute_total_loss(
             logits=logits,
             targets=sample.target_tokens,
@@ -146,6 +146,7 @@ class IMTTrainer:
             pad_id=self.tokenizer.pad_id,
             lambda_retrieval=self.train_config.lambda_retrieval,
             lambda_reg=self.train_config.lambda_regularization,
+            all_chunk_scores=all_chunk_scores,
         )
 
         # Compute additional metrics
@@ -199,7 +200,7 @@ class IMTTrainer:
             sample = self.dataset.generate_sample()
 
             # Forward pass (no gradients)
-            logits, retrieval_scores, chunk_indices, _ = self.model(
+            logits, retrieval_scores, chunk_indices, _, _ = self.model(
                 sample.chunk_tokens,
                 sample.query_tokens,
             )

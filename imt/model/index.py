@@ -97,7 +97,7 @@ class LearnedIndexSearch(nn.Module):
         self,
         query: mx.array,
         index: Dict[str, Any],
-    ) -> Tuple[mx.array, mx.array, mx.array]:
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
         """Differentiable search: retrieve relevant chunks for a query.
 
         Args:
@@ -109,6 +109,8 @@ class LearnedIndexSearch(nn.Module):
                 (batch, top_k, chunk_size, d_model).
             retrieval_scores: Relevance scores of shape (batch, top_k).
             chunk_indices: Retrieved chunk indices of shape (batch, top_k).
+            all_chunk_scores: Scores for ALL chunks of shape (batch, num_chunks).
+                Used for retrieval supervision during training.
         """
         batch_size = query.shape[0]
         chunk_size = index["chunk_hidden"].shape[1]
@@ -127,27 +129,23 @@ class LearnedIndexSearch(nn.Module):
         flat_keys = index["flat_keys"]  # (total_keys, index_dim)
         cluster_assignments = index["cluster_assignments"]  # (total_keys, num_clusters)
 
-        # Key relevance = query-key similarity
-        query_key_norm = query_key / (mx.linalg.norm(query_key, axis=-1, keepdims=True) + 1e-8)
-        flat_keys_norm = flat_keys / (mx.linalg.norm(flat_keys, axis=-1, keepdims=True) + 1e-8)
-        key_scores = mx.matmul(query_key_norm, flat_keys_norm.T)  # (batch, total_keys)
+        # Key relevance = dot product (not normalized - allows magnitude to matter)
+        # This gives stronger gradient signal than cosine similarity
+        key_scores = mx.matmul(query_key, flat_keys.T)  # (batch, total_keys)
 
-        # Weight by how much each key belongs to clusters the query likes
-        cluster_key_weight = mx.matmul(
-            cluster_weights, cluster_assignments.T
-        )  # (batch, total_keys)
-        weighted_scores = key_scores * cluster_key_weight
-
-        # Step 3: Aggregate to chunk level
+        # Step 3: Aggregate to chunk level (skip cluster weighting for simplicity)
         num_chunks = index["num_chunks"]
         keys_per_chunk = index["keys_per_chunk"]
-        chunk_scores = weighted_scores.reshape(batch_size, num_chunks, keys_per_chunk)
+        chunk_scores = key_scores.reshape(batch_size, num_chunks, keys_per_chunk)
 
         # Max-pool over keys within each chunk
         chunk_relevance = mx.max(chunk_scores, axis=-1)  # (batch, num_chunks)
 
+        # Scale for reasonable softmax behavior
+        chunk_relevance_scaled = chunk_relevance / self.temperature
+
         # Soft top-k selection using softmax with low temperature
-        retrieval_weights = mx.softmax(chunk_relevance / (self.temperature * 0.1), axis=-1)
+        retrieval_weights = mx.softmax(chunk_relevance_scaled / (self.temperature * 0.1), axis=-1)
 
         # Get top-k chunk indices (for actual retrieval)
         sorted_indices = mx.argsort(-chunk_relevance, axis=-1)
@@ -162,7 +160,8 @@ class LearnedIndexSearch(nn.Module):
         # Get retrieval scores for the selected chunks
         retrieval_scores = mx.take_along_axis(retrieval_weights, top_k_indices, axis=1)
 
-        return retrieved_hidden, retrieval_scores, top_k_indices
+        # Return all_chunk_scores (scaled) for retrieval supervision
+        return retrieved_hidden, retrieval_scores, top_k_indices, chunk_relevance_scaled
 
     def _gather_chunks(
         self,
