@@ -1,7 +1,6 @@
 # HashHop Long Context Evaluation
 
-This repository contains the code for
-HashHop, [our long context architecture benchmark](https://magic.dev/blog/100m-token-context-windows).
+This repository contains the code for HashHop, a long context architecture benchmark, along with an **Indexed Memory Transformer (IMT)** implementation optimized for Apple Silicon using MLX.
 
 ## Installation Guide
 
@@ -10,17 +9,18 @@ HashHop, [our long context architecture benchmark](https://magic.dev/blog/100m-t
 - Git
 - Python 3.9+
 - [Poetry](https://python-poetry.org/docs/#installation)
+- Apple Silicon Mac (M1/M2/M3) for IMT training
 
 ### Steps
 
 1. Clone the repository:
-   ```
+   ```bash
    git clone git@github.com:magicproduct/hash-hop.git
    cd hash-hop
    ```
 
 2. Install dependencies:
-   ```
+   ```bash
    poetry install
    ```
 
@@ -73,18 +73,50 @@ print(datapoint.targets)
     - If chain of thought is true, will contain full chain {H1: H2 = H3} (e.g. 'KeiVcwXpnYIWLPmk': 'GmmNmICdvEErHgei =
       JhgvBFdYCnLVZBoy')
 
-## Citation
+## Indexed Memory Transformer (IMT)
 
+The IMT is a novel architecture designed specifically for long-context hash retrieval tasks on Apple Silicon. It uses MLX for efficient training and inference.
+
+### Architecture
+
+- **ChunkEncoder**: 2-layer transformer that processes 512-token chunks independently
+- **IndexKeyExtractor**: Learns to extract searchable keys from chunk representations
+- **LearnedIndexSearch**: Differentiable approximate nearest neighbor retrieval with learned clusters
+- **LocalDecoder**: 3-layer transformer that attends to retrieved chunks to produce answers
+
+### Training
+
+```bash
+# Quick iteration (1M context, ~10 minutes)
+python scripts/train_imt.py --config configs/imt_nano_small.yaml
+
+# Full training (10M context)
+python scripts/train_imt.py --config configs/imt_nano.yaml
+
+# With custom memory limit (default is 50%)
+python scripts/train_imt.py --config configs/imt_nano_small.yaml --memory-limit 0.3
+
+# Resume from checkpoint
+python scripts/train_imt.py --config configs/imt_nano.yaml --resume checkpoints/imt_xxx/step_1000
 ```
-@misc{magic2024hashhop,
-  author = {Magic},
-  title = {HashHop: Long Context Evaluation},
-  year = {2024},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/magicproduct/hash-hop}},
-}
+
+### Evaluation
+
+```bash
+python scripts/eval_imt.py --checkpoint checkpoints/imt_xxx/best --num-samples 100
 ```
+
+### Configuration
+
+Two preset configurations are available:
+
+- `configs/imt_nano.yaml`: Full 10M token context, ~12-15M parameters
+- `configs/imt_nano_small.yaml`: 1M token context for quick iteration
+
+Key configuration options:
+- `memory_limit_fraction`: Limits VRAM usage (default: 0.5 = 50%)
+- `chunk_batch_size`: Number of chunks processed per batch
+- `use_gradient_checkpointing`: Enable memory-efficient training
 
 ## License
 
