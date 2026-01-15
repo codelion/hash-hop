@@ -96,11 +96,12 @@ def compute_index_regularization(
     centroids: mx.array,
     temperature: float = 1.0,
 ) -> mx.array:
-    """Regularization to encourage diverse, well-separated clusters.
+    """Regularization to encourage diverse, well-separated keys and clusters.
 
-    Two objectives:
+    Three objectives:
     1. Keys should be close to their assigned centroid
     2. Centroids should be spread apart (diverse)
+    3. Chunk-level key representations should be diverse (NEW)
 
     Args:
         index_keys: Keys of shape (num_chunks, keys_per_chunk, index_dim).
@@ -110,6 +111,8 @@ def compute_index_regularization(
     Returns:
         Scalar regularization loss.
     """
+    num_chunks = index_keys.shape[0]
+
     # Flatten keys
     flat_keys = index_keys.reshape(-1, index_keys.shape[-1])
 
@@ -134,7 +137,17 @@ def compute_index_regularization(
     mask = 1 - mx.eye(num_centroids)
     centroid_diversity_loss = mx.mean(centroid_sim * mask)
 
-    return key_centroid_loss + 0.1 * centroid_diversity_loss
+    # Loss 3: Chunk keys should be diverse (encourage different chunks to have different keys)
+    # Average keys per chunk to get chunk-level representation
+    chunk_key_repr = mx.mean(index_keys, axis=1)  # (num_chunks, index_dim)
+    chunk_key_norm = chunk_key_repr / (mx.linalg.norm(chunk_key_repr, axis=-1, keepdims=True) + 1e-8)
+    chunk_sim = mx.matmul(chunk_key_norm, chunk_key_norm.T)  # (num_chunks, num_chunks)
+
+    # Penalize high similarity between different chunks
+    chunk_mask = 1 - mx.eye(num_chunks)
+    chunk_diversity_loss = mx.mean(chunk_sim * chunk_mask)
+
+    return key_centroid_loss + 0.1 * centroid_diversity_loss + 0.5 * chunk_diversity_loss
 
 
 def compute_total_loss(

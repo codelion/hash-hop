@@ -38,8 +38,19 @@ class LearnedIndexSearch(nn.Module):
         # Learned cluster centroids
         self.centroids = mx.random.normal((config.num_clusters, config.index_dim)) * 0.1
 
-        # Query transformation for better matching
-        self.query_proj = nn.Linear(config.d_model, config.index_dim)
+        # Query encoder: multi-layer projection to match index key space
+        # Raw embeddings need more processing to match fully-encoded index keys
+        self.query_encoder = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.index_dim),
+        )
+
+        # Learnable scale for query keys (helps match index key magnitudes)
+        # Initialize larger to match index key std (~0.5-0.6)
+        self.query_scale = mx.array(5.0)
 
     def build_index(
         self,
@@ -116,8 +127,10 @@ class LearnedIndexSearch(nn.Module):
         chunk_size = index["chunk_hidden"].shape[1]
         d_model = index["chunk_hidden"].shape[2]
 
-        # Project query to index space
-        query_key = self.query_proj(query)  # (batch, index_dim)
+        # Project query to index space using deeper encoder
+        query_key = self.query_encoder(query)  # (batch, index_dim)
+        # Scale to match index key magnitudes
+        query_key = query_key * self.query_scale
 
         # Step 1: Soft cluster selection
         cluster_scores = self._compute_cluster_scores(query_key)  # (batch, num_clusters)
@@ -141,8 +154,12 @@ class LearnedIndexSearch(nn.Module):
         # Max-pool over keys within each chunk
         chunk_relevance = mx.max(chunk_scores, axis=-1)  # (batch, num_chunks)
 
+        # Normalize scores to have zero mean (prevents any chunk from dominating)
+        # This is critical for stable training
+        chunk_relevance_centered = chunk_relevance - mx.mean(chunk_relevance, axis=-1, keepdims=True)
+
         # Scale for reasonable softmax behavior
-        chunk_relevance_scaled = chunk_relevance / self.temperature
+        chunk_relevance_scaled = chunk_relevance_centered / self.temperature
 
         # Soft top-k selection using softmax with low temperature
         retrieval_weights = mx.softmax(chunk_relevance_scaled / (self.temperature * 0.1), axis=-1)

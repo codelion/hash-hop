@@ -104,6 +104,17 @@ class LocalDecoder(nn.Module):
         self.norm = nn.RMSNorm(config.d_model)
         self.output_proj = nn.Linear(config.d_model, config.vocab_size)
 
+        # Query representation encoder (for retrieval)
+        # Use self-attention to capture sequence patterns, not just mean pooling
+        self.query_self_attn = nn.MultiHeadAttention(config.d_model, config.decoder_heads)
+        self.query_ff = nn.Sequential(
+            nn.Linear(config.d_model, config.decoder_ff_dim),
+            nn.GELU(),
+            nn.Linear(config.decoder_ff_dim, config.d_model),
+        )
+        self.query_norm1 = nn.RMSNorm(config.d_model)
+        self.query_norm2 = nn.RMSNorm(config.d_model)
+
     def __call__(
         self,
         query_tokens: mx.array,
@@ -155,6 +166,9 @@ class LocalDecoder(nn.Module):
     def get_query_representation(self, query_tokens: mx.array) -> mx.array:
         """Get query representation for retrieval (without full decoding).
 
+        Uses self-attention to capture sequence patterns in the hash,
+        rather than just mean pooling which loses distinctive information.
+
         Args:
             query_tokens: Hash tokens of shape (batch, query_len).
 
@@ -163,4 +177,16 @@ class LocalDecoder(nn.Module):
         """
         positions = mx.arange(query_tokens.shape[1])
         x = self.query_embed(query_tokens) + self.query_pos_embed(positions)
+
+        # Self-attention layer to capture sequence patterns
+        h = self.query_norm1(x)
+        h = self.query_self_attn(h, h, h)
+        x = x + h
+
+        # Feed-forward
+        h = self.query_norm2(x)
+        h = self.query_ff(h)
+        x = x + h
+
+        # Now pool - the representations are more distinctive after attention
         return mx.mean(x, axis=1)
