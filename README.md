@@ -1,99 +1,87 @@
 # HashHop Long Context Evaluation
 
-This repository contains the code for HashHop, a long context architecture benchmark, along with an **Indexed Memory Transformer (IMT)** implementation optimized for Apple Silicon using MLX.
+HashHop is a benchmark for evaluating long-context retrieval capabilities of large language models. It tests an LLM's ability to follow chains of hash-pair associations across long prompts (up to millions of tokens).
 
-## Installation Guide
+This repository includes:
+1. **The HashHop Benchmark**: Data generation for multi-hop hash retrieval tasks
+2. **Indexed Memory Transformer (IMT)**: A novel architecture optimized for Apple Silicon using MLX
+
+> **Note**: This project is based on the original [HashHop benchmark by Magic](https://github.com/magicproduct/hash-hop). We have extended it with our own IMT implementation and benchmark results.
+
+## Installation
 
 ### Prerequisites
 
-- Git
 - Python 3.9+
 - [Poetry](https://python-poetry.org/docs/#installation)
 - Apple Silicon Mac (M1/M2/M3) for IMT training
 
-### Steps
+### Setup
 
-1. Clone the repository:
-   ```bash
-   git clone git@github.com:magicproduct/hash-hop.git
-   cd hash-hop
-   ```
+```bash
+git clone https://github.com/codelion/hash-hop.git
+cd hash-hop
+poetry install
+```
 
-2. Install dependencies:
-   ```bash
-   poetry install
-   ```
+## The HashHop Benchmark
 
-## Generating Evaluation Data
+HashHop evaluates a model's ability to retrieve information across long contexts by following chains of hash assignments. For example, given thousands of assignments like `H1 = H2`, `H2 = H3`, `H3 = 'answer'`, the model must follow the chain from a query hash to find the final quoted value.
 
-The `MultiHopEval.make_one` function generates a `MultiHopSample` object which can be used for either evaluation (via
-the `targets` field) or for training models on the multihop task (via the `completion` field).
-
-### Usage Example
+### Generating Evaluation Data
 
 ```python
 from hashhop import MultiHopEval
 
-CHARS_PER_TOKEN = 3
 datapoint = MultiHopEval.make_one(
-    n_chars_problem=int(1_000_000 * CHARS_PER_TOKEN),
+    n_chars_problem=1_000_000,  # ~1M tokens
     num_queries=5,
     hops=2,
     hash_pair_str_length=16,
     chain_of_thought=False,
 )
-print(datapoint.prompt)
-print(datapoint.completion)
-print(datapoint.targets)
+print(datapoint.prompt)      # Shuffled hash pairs
+print(datapoint.targets)     # Query -> answer mapping for evaluation
 ```
 
 ### Parameters
 
-- `n_chars_problem`: int
-    - The size of the problem in characters.
-- `num_queries`: int
-    - The number of queries in the completion.
-- `hops`: int
-    - The number of hops in the reasoning chain.
-- `hash_pair_str_length`: int
-    - The number of characters per hash.
-- `chain_of_thought`: bool
-    - If True, the model is asked to produce H1 -> H2 -> H3.
-    - If False, the model is asked to produce H1 -> H3.
-
-### Output
-
-- `prompt`: str
-    - Contains the shuffled hash pairs.
-- (Used for training) `completion`: str
-    - The queries and targets in string format
-- (Used for evaluation) `targets`: Dict[str, str]
-    - Contains query-ground truth pairs in structured format
-    - If chain of thought is false, will contain {H1: H3} (e.g. 'HETyxiWTFSVUYega': 'pChfybAJRUBmdAGC')
-    - If chain of thought is true, will contain full chain {H1: H2 = H3} (e.g. 'KeiVcwXpnYIWLPmk': 'GmmNmICdvEErHgei =
-      JhgvBFdYCnLVZBoy')
+| Parameter | Description |
+|-----------|-------------|
+| `n_chars_problem` | Total prompt size in characters |
+| `num_queries` | Number of queries to answer |
+| `hops` | Chain length (number of hops to follow) |
+| `hash_pair_str_length` | Characters per hash string |
+| `chain_of_thought` | If True, output includes intermediate steps |
 
 ## Indexed Memory Transformer (IMT)
 
-The IMT is a novel architecture designed specifically for long-context hash retrieval tasks on Apple Silicon. It uses MLX for efficient training and inference.
+The IMT is our novel architecture designed specifically for long-context retrieval tasks. Instead of using full attention over millions of tokens, it:
+
+1. **Chunks** the context into manageable 512-token segments
+2. **Indexes** each chunk with learned keys for fast retrieval
+3. **Retrieves** only the relevant chunks for each query
+4. **Decodes** the answer using local attention over retrieved chunks
+
+This approach enables efficient training and inference on Apple Silicon with configurable memory limits.
 
 ### Architecture
 
-- **ChunkEncoder**: 2-layer transformer that processes 512-token chunks independently
-- **IndexKeyExtractor**: Learns to extract searchable keys from chunk representations
-- **LearnedIndexSearch**: Differentiable approximate nearest neighbor retrieval with learned clusters
-- **LocalDecoder**: 3-layer transformer that attends to retrieved chunks to produce answers
+- **ChunkEncoder**: 2-layer transformer processing 512-token chunks
+- **IndexKeyExtractor**: Learns searchable keys from chunk representations
+- **LearnedIndexSearch**: Differentiable approximate nearest neighbor retrieval
+- **LocalDecoder**: 3-layer transformer attending to retrieved chunks
 
 ### Training
 
 ```bash
-# Quick iteration (1M context, ~10 minutes)
+# Quick iteration (1M context)
 python scripts/train_imt.py --config configs/imt_nano_small.yaml
 
 # Full training (10M context)
 python scripts/train_imt.py --config configs/imt_nano.yaml
 
-# With custom memory limit (default is 50%)
+# Limit GPU memory to 30% (default is 50%)
 python scripts/train_imt.py --config configs/imt_nano_small.yaml --memory-limit 0.3
 
 # Resume from checkpoint
@@ -108,15 +96,24 @@ python scripts/eval_imt.py --checkpoint checkpoints/imt_xxx/best --num-samples 1
 
 ### Configuration
 
-Two preset configurations are available:
+| Config | Context Size | Parameters | Use Case |
+|--------|-------------|------------|----------|
+| `imt_nano_small.yaml` | 1M tokens | ~12-15M | Quick iteration |
+| `imt_nano.yaml` | 10M tokens | ~12-15M | Full training |
 
-- `configs/imt_nano.yaml`: Full 10M token context, ~12-15M parameters
-- `configs/imt_nano_small.yaml`: 1M token context for quick iteration
+Key options:
+- `memory_limit_fraction`: VRAM limit (default: 0.5 = 50%)
+- `chunk_batch_size`: Chunks per encoding batch
+- `use_gradient_checkpointing`: Memory-efficient training
 
-Key configuration options:
-- `memory_limit_fraction`: Limits VRAM usage (default: 0.5 = 50%)
-- `chunk_batch_size`: Number of chunks processed per batch
-- `use_gradient_checkpointing`: Enable memory-efficient training
+## Results
+
+*Coming soon: Benchmark results comparing IMT against baseline approaches.*
+
+## Acknowledgments
+
+- Original HashHop benchmark: [Magic](https://github.com/magicproduct/hash-hop)
+- MLX framework: [Apple](https://github.com/ml-explore/mlx)
 
 ## License
 
