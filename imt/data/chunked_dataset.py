@@ -1,9 +1,12 @@
 """Chunked dataset for IMT training on HashHop tasks."""
 
+import random
+import string
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 from hashhop.generate import MultiHopEval, MultiHopSample
 from imt.config import IMTConfig, TrainingConfig
@@ -21,6 +24,12 @@ class ChunkedSample:
     raw_sample: MultiHopSample  # Original sample for debugging
 
 
+def make_random_string(length: int) -> str:
+    """Generate a random alphanumeric string."""
+    alphabet = string.ascii_lowercase + string.ascii_uppercase
+    return "".join(alphabet[ix] for ix in np.random.choice(len(alphabet), length))
+
+
 class ChunkedHashHopDataset:
     """Dataset that generates chunked HashHop samples.
 
@@ -29,6 +38,9 @@ class ChunkedHashHopDataset:
     - query_tokens: (num_queries, max_hash_length) - hash queries
     - target_tokens: (num_queries, max_hash_length) - expected answers
     - target_chunk_indices: (num_queries,) - which chunk contains the answer
+
+    Can use either original HashHop format (KEY = 'VALUE') or simplified
+    format (KEY>VALUE) which is easier for the model to learn.
     """
 
     def __init__(
@@ -36,6 +48,7 @@ class ChunkedHashHopDataset:
         config: IMTConfig,
         train_config: TrainingConfig,
         tokenizer: HashTokenizer,
+        use_simple_format: bool = True,
     ) -> None:
         """Initialize dataset.
 
@@ -43,10 +56,39 @@ class ChunkedHashHopDataset:
             config: Model configuration.
             train_config: Training configuration.
             tokenizer: Character-level tokenizer.
+            use_simple_format: If True, use simplified KEY>VALUE format.
         """
         self.config = config
         self.train_config = train_config
         self.tokenizer = tokenizer
+        self.use_simple_format = use_simple_format
+
+    def _generate_simple_sample(self) -> Tuple[str, Dict[str, str]]:
+        """Generate a sample with simplified KEY>VALUE format.
+
+        Returns:
+            Tuple of (prompt, targets_dict).
+        """
+        hash_len = self.train_config.hash_pair_str_length
+        # Calculate number of pairs needed to fill n_chars_problem
+        # Format: "KEY>VALUE\n" = hash_len*2 + 2 chars
+        chars_per_pair = hash_len * 2 + 2
+        n_pairs = max(10, self.train_config.n_chars_problem // chars_per_pair)
+
+        # Generate random key-value pairs
+        pairs: Dict[str, str] = {}
+        for _ in range(n_pairs):
+            key = make_random_string(hash_len)
+            value = make_random_string(hash_len)
+            pairs[key] = value
+
+        # Shuffle and create prompt
+        items = list(pairs.items())
+        random.shuffle(items)
+        lines = [f"{k}>{v}" for k, v in items]
+        prompt = "\n".join(lines)
+
+        return prompt, pairs
 
     def generate_sample(self) -> ChunkedSample:
         """Generate a single chunked sample.
@@ -54,29 +96,51 @@ class ChunkedHashHopDataset:
         Returns:
             ChunkedSample with tokenized chunks, queries, and targets.
         """
-        # Generate raw HashHop sample
-        sample = MultiHopEval.make_one(
-            n_chars_problem=self.train_config.n_chars_problem,
-            num_queries=self.train_config.num_queries,
-            hops=self.train_config.hops,
-            hash_pair_str_length=self.train_config.hash_pair_str_length,
-            chain_of_thought=False,  # Direct mapping for IMT
-        )
+        if self.use_simple_format:
+            # Use simplified format
+            prompt, all_targets = self._generate_simple_sample()
 
-        # Tokenize and chunk the prompt
-        chunk_tokens, line_to_chunk = self._tokenize_and_chunk(sample.prompt)
+            # Create a minimal sample for debugging
+            sample = MultiHopSample(
+                prompt=prompt,
+                completion="",
+                targets=all_targets,
+            )
 
-        # Prepare queries and targets (only use num_queries, as per the completion)
-        queries = list(sample.targets.keys())[: self.train_config.num_queries]
-        targets = list(sample.targets.values())[: self.train_config.num_queries]
+            # Select queries
+            all_keys = list(all_targets.keys())
+            random.shuffle(all_keys)
+            queries = all_keys[: self.train_config.num_queries]
+            targets = [all_targets[q] for q in queries]
+
+            # Tokenize and chunk
+            chunk_tokens, line_to_chunk = self._tokenize_and_chunk(prompt)
+
+            # Find target chunks using simple format parsing
+            target_chunk_indices = self._find_target_chunks_simple(
+                prompt, queries, line_to_chunk
+            )
+        else:
+            # Use original HashHop format
+            sample = MultiHopEval.make_one(
+                n_chars_problem=self.train_config.n_chars_problem,
+                num_queries=self.train_config.num_queries,
+                hops=self.train_config.hops,
+                hash_pair_str_length=self.train_config.hash_pair_str_length,
+                chain_of_thought=False,
+            )
+
+            chunk_tokens, line_to_chunk = self._tokenize_and_chunk(sample.prompt)
+
+            queries = list(sample.targets.keys())[: self.train_config.num_queries]
+            targets = list(sample.targets.values())[: self.train_config.num_queries]
+
+            target_chunk_indices = self._find_target_chunks(
+                sample.prompt, queries, targets, line_to_chunk
+            )
 
         query_tokens = self.tokenizer.encode_batch(queries, self.config.max_hash_length)
         target_tokens = self.tokenizer.encode_batch(targets, self.config.max_hash_length)
-
-        # Find which chunks contain the target answers (for retrieval supervision)
-        target_chunk_indices = self._find_target_chunks(
-            sample.prompt, queries, targets, line_to_chunk
-        )
 
         return ChunkedSample(
             chunk_tokens=chunk_tokens,
@@ -85,6 +149,40 @@ class ChunkedHashHopDataset:
             target_chunk_indices=mx.array(target_chunk_indices, dtype=mx.int32),
             raw_sample=sample,
         )
+
+    def _find_target_chunks_simple(
+        self,
+        prompt: str,
+        queries: List[str],
+        line_to_chunk: Dict[int, int],
+    ) -> List[int]:
+        """Find target chunks for simplified format.
+
+        Args:
+            prompt: The prompt with KEY>VALUE pairs.
+            queries: List of query keys.
+            line_to_chunk: Mapping from line index to chunk index.
+
+        Returns:
+            List of chunk indices for each query.
+        """
+        lines = prompt.split("\n")
+        key_to_line: Dict[str, int] = {}
+        for line_idx, line in enumerate(lines):
+            if ">" in line:
+                key = line.split(">")[0]
+                key_to_line[key] = line_idx
+
+        target_chunks = []
+        for query in queries:
+            if query in key_to_line:
+                line_idx = key_to_line[query]
+                chunk_idx = line_to_chunk.get(line_idx, 0)
+            else:
+                chunk_idx = 0  # Fallback
+            target_chunks.append(chunk_idx)
+
+        return target_chunks
 
     def _tokenize_and_chunk(self, prompt: str) -> Tuple[mx.array, Dict[int, int]]:
         """Tokenize prompt and split into fixed-size chunks.

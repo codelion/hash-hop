@@ -54,8 +54,8 @@ class TestHashTokenizer:
 
     def test_vocab_size(self, tokenizer: HashTokenizer) -> None:
         """Test vocab size is correct."""
-        # 8 special + 26 lowercase + 26 uppercase + 10 digits = 70
-        assert tokenizer.vocab_size == 70
+        # 9 special + 26 lowercase + 26 uppercase + 10 digits = 71
+        assert tokenizer.vocab_size == 71
 
     def test_encode_decode_roundtrip(self, tokenizer: HashTokenizer) -> None:
         """Test encode/decode roundtrip."""

@@ -219,12 +219,17 @@ class IMTTrainer:
             # Exact match accuracy (per query)
             predictions = mx.argmax(logits, axis=-1)
             for i in range(predictions.shape[0]):
-                pred_str = self.tokenizer.strip_padding(
-                    self.tokenizer.decode(predictions[i].tolist())
-                )
-                target_str = self.tokenizer.strip_padding(
-                    self.tokenizer.decode(sample.target_tokens[i].tolist())
-                )
+                # Find actual length of target (exclude padding)
+                target_tokens = sample.target_tokens[i].tolist()
+                actual_len = sum(1 for t in target_tokens if t != self.tokenizer.pad_id)
+
+                # Compare only up to actual target length
+                pred_tokens = predictions[i].tolist()[:actual_len]
+                target_tokens = target_tokens[:actual_len]
+
+                pred_str = self.tokenizer.decode(pred_tokens)
+                target_str = self.tokenizer.decode(target_tokens)
+
                 if pred_str == target_str:
                     exact_matches += 1
                 total_queries += 1

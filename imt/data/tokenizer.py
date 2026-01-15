@@ -9,12 +9,12 @@ class HashTokenizer:
     """Simple character-level tokenizer for HashHop.
 
     Vocabulary:
-    - Special tokens: PAD, UNK, BOS, EOS, EQUALS, QUOTE, SPACE, NEWLINE
+    - Special tokens: PAD, UNK, BOS, EOS, EQUALS, QUOTE, SPACE, NEWLINE, GT
     - a-z (26)
     - A-Z (26)
     - 0-9 (10)
 
-    Total vocab size: 70
+    Total vocab size: 71
     """
 
     SPECIAL_TOKENS = {
@@ -26,6 +26,7 @@ class HashTokenizer:
         "'": 5,
         " ": 6,
         "\n": 7,
+        ">": 8,  # For simplified KEY>VALUE format
     }
 
     def __init__(self) -> None:

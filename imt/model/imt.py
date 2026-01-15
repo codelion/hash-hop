@@ -112,12 +112,15 @@ class IndexedMemoryTransformer(nn.Module):
         self,
         query_tokens: mx.array,
         index: Dict[str, Any],
+        chunk_tokens: Optional[mx.array] = None,
     ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
         """Process queries against the index.
 
         Args:
             query_tokens: Query hash tokens of shape (batch, query_len).
             index: Index built by build_index().
+            chunk_tokens: Optional chunk tokens of shape (num_chunks, chunk_size)
+                for copy mechanism.
 
         Returns:
             logits: Output logits of shape (batch, query_len, vocab_size).
@@ -128,13 +131,41 @@ class IndexedMemoryTransformer(nn.Module):
         # Initial query embedding for retrieval
         query_repr = self.decoder.get_query_representation(query_tokens)
 
-        # Retrieve relevant chunks
+        # Retrieve relevant chunks (pass query/chunk tokens for token-matching boost)
         retrieved_hidden, retrieval_scores, chunk_indices, all_chunk_scores = (
-            self.index_search.search(query_repr, index)
+            self.index_search.search(
+                query_repr, index,
+                query_tokens=query_tokens,
+                chunk_tokens=chunk_tokens,
+            )
         )
 
+        # Get context tokens for copy mechanism if chunk_tokens provided
+        context_tokens = None
+        if chunk_tokens is not None:
+            batch_size = query_tokens.shape[0]
+            top_k = chunk_indices.shape[1]
+            chunk_size = chunk_tokens.shape[1]
+
+            # Gather tokens for retrieved chunks
+            # chunk_indices: (batch, top_k)
+            # chunk_tokens: (num_chunks, chunk_size)
+            # We need: (batch, top_k * chunk_size)
+            retrieved_tokens = []
+            for i in range(batch_size):
+                batch_tokens = []
+                for j in range(top_k):
+                    idx = int(chunk_indices[i, j])
+                    batch_tokens.append(chunk_tokens[idx])
+                # Stack and flatten: (top_k, chunk_size) -> (top_k * chunk_size,)
+                batch_tokens = mx.concatenate(batch_tokens, axis=0)
+                retrieved_tokens.append(batch_tokens)
+            context_tokens = mx.stack(retrieved_tokens)  # (batch, top_k * chunk_size)
+
         # Decode answer
-        logits, _ = self.decoder(query_tokens, retrieved_hidden, retrieval_scores)
+        logits, _ = self.decoder(
+            query_tokens, retrieved_hidden, retrieval_scores, context_tokens
+        )
 
         return logits, retrieval_scores, chunk_indices, all_chunk_scores
 
@@ -168,9 +199,9 @@ class IndexedMemoryTransformer(nn.Module):
             index = precomputed_index
             index_keys = index["keys"]
 
-        # Process queries
+        # Process queries (pass chunk_tokens for copy mechanism)
         logits, retrieval_scores, chunk_indices, all_chunk_scores = self.forward_query(
-            query_tokens, index
+            query_tokens, index, chunk_tokens
         )
 
         return logits, retrieval_scores, chunk_indices, index_keys, all_chunk_scores
