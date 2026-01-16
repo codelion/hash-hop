@@ -21,6 +21,10 @@ class ChunkedSample:
     query_tokens: mx.array  # (num_queries, max_hash_length)
     target_tokens: mx.array  # (num_queries, max_hash_length)
     target_chunk_indices: mx.array  # (num_queries,) - which chunk contains answer
+    # Copy supervision: for each output position, which context position to copy from
+    # Shape: (num_queries, max_hash_length, chunk_size)
+    # For output position i, copy_targets[q, i, :] is a one-hot over chunk positions
+    copy_targets: mx.array
     raw_sample: MultiHopSample  # Original sample for debugging
 
 
@@ -100,18 +104,19 @@ class ChunkedHashHopDataset:
             # Use simplified format
             prompt, all_targets = self._generate_simple_sample()
 
-            # Create a minimal sample for debugging
-            sample = MultiHopSample(
-                prompt=prompt,
-                completion="",
-                targets=all_targets,
-            )
-
-            # Select queries
+            # Select queries first
             all_keys = list(all_targets.keys())
             random.shuffle(all_keys)
             queries = all_keys[: self.train_config.num_queries]
             targets = [all_targets[q] for q in queries]
+
+            # Create a sample with ONLY the selected queries/targets for debugging
+            selected_targets = {q: all_targets[q] for q in queries}
+            sample = MultiHopSample(
+                prompt=prompt,
+                completion="",
+                targets=selected_targets,
+            )
 
             # Tokenize and chunk
             chunk_tokens, line_to_chunk = self._tokenize_and_chunk(prompt)
@@ -142,11 +147,17 @@ class ChunkedHashHopDataset:
         query_tokens = self.tokenizer.encode_batch(queries, self.config.max_hash_length)
         target_tokens = self.tokenizer.encode_batch(targets, self.config.max_hash_length)
 
+        # Compute copy targets - which positions in the target chunk contain answer
+        copy_targets = self._compute_copy_targets(
+            chunk_tokens, target_chunk_indices, targets
+        )
+
         return ChunkedSample(
             chunk_tokens=chunk_tokens,
             query_tokens=query_tokens,
             target_tokens=target_tokens,
             target_chunk_indices=mx.array(target_chunk_indices, dtype=mx.int32),
+            copy_targets=copy_targets,
             raw_sample=sample,
         )
 
@@ -289,6 +300,68 @@ class ChunkedHashHopDataset:
             if f"= '{target}'" in line or f"= {target}" in line:
                 return line_to_chunk.get(line_idx, 0)
         return 0
+
+    def _compute_copy_targets(
+        self,
+        chunk_tokens: mx.array,
+        target_chunk_indices: List[int],
+        targets: List[str],
+    ) -> mx.array:
+        """Compute position-specific copy supervision targets.
+
+        For each query and each output position, create a one-hot mask indicating
+        which context position contains the token to copy. This provides explicit
+        supervision for where copy attention should focus at each generation step.
+
+        Args:
+            chunk_tokens: All chunk tokens (num_chunks, chunk_size).
+            target_chunk_indices: List of target chunk indices per query.
+            targets: List of target strings.
+
+        Returns:
+            Copy targets array of shape (num_queries, max_hash_length, chunk_size)
+            where copy_targets[q, i, j] = 1.0 if output position i should copy
+            from context position j.
+        """
+        num_queries = len(targets)
+        chunk_size = chunk_tokens.shape[1]
+        max_hash_length = self.config.max_hash_length
+
+        # Initialize copy targets as numpy for easier manipulation
+        # Shape: (num_queries, max_hash_length, chunk_size)
+        copy_targets_np = np.zeros((num_queries, max_hash_length, chunk_size), dtype=np.float32)
+
+        for q_idx, (chunk_idx, target) in enumerate(zip(target_chunk_indices, targets)):
+            # Get the target chunk's tokens
+            chunk_tokens_np = np.array(chunk_tokens[chunk_idx].tolist())
+
+            # Encode target to get its tokens
+            target_tokens = self.tokenizer.encode(target)
+            target_len = len(target_tokens)
+
+            # Find where the target sequence starts in the chunk
+            start_pos = -1
+            for pos in range(chunk_size - target_len + 1):
+                if list(chunk_tokens_np[pos:pos + target_len]) == target_tokens:
+                    start_pos = pos
+                    break
+
+            if start_pos >= 0:
+                # Found the target sequence - create position-specific targets
+                for i, t_tok in enumerate(target_tokens):
+                    if i < max_hash_length:
+                        # Output position i should copy from context position start_pos + i
+                        copy_targets_np[q_idx, i, start_pos + i] = 1.0
+            else:
+                # Fallback: for each output position, find any matching token
+                for i, t_tok in enumerate(target_tokens):
+                    if i < max_hash_length and t_tok != self.tokenizer.pad_id:
+                        positions = np.where(chunk_tokens_np == t_tok)[0]
+                        if len(positions) > 0:
+                            # Use first matching position
+                            copy_targets_np[q_idx, i, positions[0]] = 1.0
+
+        return mx.array(copy_targets_np)
 
     def stream_samples(
         self,

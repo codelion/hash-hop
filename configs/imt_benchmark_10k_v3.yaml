@@ -1,0 +1,63 @@
+# IMT Benchmark: 10K tokens - v3
+#
+# Much longer training with log-space copy logits
+# Target: improve from 34% to 60%+
+
+model:
+  d_model: 128
+  encoder_layers: 2
+  encoder_heads: 4
+  encoder_ff_dim: 512
+  chunk_size: 64  # Small chunks for better retrieval
+
+  # Index configuration
+  index_dim: 64
+  num_index_heads: 4
+  keys_per_chunk: 2
+  temperature: 1.0
+
+  # Clustering (for larger contexts)
+  num_clusters: 512
+
+  # Decoder
+  decoder_layers: 4
+  decoder_heads: 4
+  decoder_ff_dim: 512
+  retrieval_top_k: 32  # Retrieve ~20% of chunks
+
+  # Vocabulary (full ASCII)
+  vocab_size: 101
+  dropout: 0.0
+  max_hash_length: 10
+
+  # Memory optimization
+  use_gradient_checkpointing: false
+  chunk_batch_size: 32
+  memory_limit_fraction: 0.5
+
+training:
+  learning_rate: 0.0005  # Lower learning rate for stability
+  weight_decay: 0.0
+  warmup_steps: 1000
+  max_steps: 50000  # Train 3x longer
+  gradient_accumulation: 1
+  eval_every: 2000
+  eval_samples: 100
+  save_every: 10000
+  log_every: 200
+
+  # 10K character context (~160 hash pairs)
+  n_chars_problem: 10000
+  num_queries: 1
+  hops: 1
+  hash_pair_str_length: 4
+
+  # Loss weights - stronger retrieval focus
+  lambda_retrieval: 10.0
+  lambda_regularization: 0.0
+  lambda_contrastive: 3.0
+  lambda_copy: 0.5
+  lambda_copy_attn: 2.0
+
+  output_dir: checkpoints
+  experiment_name: benchmark_10k_v3

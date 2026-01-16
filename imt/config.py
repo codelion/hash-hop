@@ -81,6 +81,9 @@ class TrainingConfig:
     # Loss weights
     lambda_retrieval: float = 0.5
     lambda_regularization: float = 0.01
+    lambda_contrastive: float = 1.0  # Weight for contrastive embedding loss
+    lambda_copy: float = 0.1  # Weight for copy gate loss
+    lambda_copy_attn: float = 1.0  # Weight for copy attention supervision loss
 
     # Output
     output_dir: str = "checkpoints"

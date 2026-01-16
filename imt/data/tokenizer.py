@@ -1,67 +1,58 @@
-"""Character-level tokenizer for HashHop tasks."""
+"""Character-level tokenizer supporting full ASCII text."""
 
 from typing import Dict, List
 
 import mlx.core as mx
 
 
-class HashTokenizer:
-    """Simple character-level tokenizer for HashHop.
+class ASCIITokenizer:
+    """Character-level tokenizer for full ASCII text.
+
+    Supports all printable ASCII characters (32-126) plus special tokens.
+    This enables the model to work with any English text or code.
 
     Vocabulary:
-    - Special tokens: PAD, UNK, BOS, EOS, EQUALS, QUOTE, SPACE, NEWLINE, GT
-    - a-z (26)
-    - A-Z (26)
-    - 0-9 (10)
+    - Special tokens: PAD, UNK, BOS, EOS (0-3)
+    - Printable ASCII characters (32-126): 95 characters
+    - Tab and newline for code formatting
 
-    Total vocab size: 71
+    Total vocab size: 100
     """
-
-    SPECIAL_TOKENS = {
-        "<PAD>": 0,
-        "<UNK>": 1,
-        "<BOS>": 2,
-        "<EOS>": 3,
-        "=": 4,
-        "'": 5,
-        " ": 6,
-        "\n": 7,
-        ">": 8,  # For simplified KEY>VALUE format
-    }
 
     def __init__(self) -> None:
         """Initialize tokenizer with character mappings."""
         self.char_to_id: Dict[str, int] = {}
         self.id_to_char: Dict[int, str] = {}
 
-        # Add special tokens
-        for token, idx in self.SPECIAL_TOKENS.items():
+        # Special tokens first
+        special_tokens = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+        for idx, token in enumerate(special_tokens):
             self.char_to_id[token] = idx
             self.id_to_char[idx] = token
 
-        # Add lowercase letters
-        offset = len(self.SPECIAL_TOKENS)
-        for i, c in enumerate("abcdefghijklmnopqrstuvwxyz"):
-            self.char_to_id[c] = offset + i
-            self.id_to_char[offset + i] = c
+        # Add tab and newline explicitly (not in printable range but needed)
+        offset = len(special_tokens)
+        self.char_to_id["\t"] = offset
+        self.id_to_char[offset] = "\t"
+        offset += 1
+        self.char_to_id["\n"] = offset
+        self.id_to_char[offset] = "\n"
+        offset += 1
 
-        # Add uppercase letters
-        offset += 26
-        for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
-            self.char_to_id[c] = offset + i
-            self.id_to_char[offset + i] = c
-
-        # Add digits
-        offset += 26
-        for i, c in enumerate("0123456789"):
-            self.char_to_id[c] = offset + i
-            self.id_to_char[offset + i] = c
+        # Add all printable ASCII characters (32-126)
+        # This includes: space, punctuation, digits, uppercase, lowercase
+        for ascii_code in range(32, 127):
+            char = chr(ascii_code)
+            if char not in self.char_to_id:  # Skip if already added
+                self.char_to_id[char] = offset
+                self.id_to_char[offset] = char
+                offset += 1
 
         self.vocab_size = len(self.char_to_id)
-        self.pad_id = self.SPECIAL_TOKENS["<PAD>"]
-        self.unk_id = self.SPECIAL_TOKENS["<UNK>"]
-        self.bos_id = self.SPECIAL_TOKENS["<BOS>"]
-        self.eos_id = self.SPECIAL_TOKENS["<EOS>"]
+        self.pad_id = 0
+        self.unk_id = 1
+        self.bos_id = 2
+        self.eos_id = 3
 
     def encode(self, text: str) -> List[int]:
         """Encode text to token IDs.
@@ -83,7 +74,14 @@ class HashTokenizer:
         Returns:
             Decoded string.
         """
-        return "".join(self.id_to_char.get(i, "<UNK>") for i in ids)
+        result = []
+        for i in ids:
+            char = self.id_to_char.get(i, "")
+            # Skip special tokens in output except whitespace
+            if char.startswith("<") and char.endswith(">"):
+                continue
+            result.append(char)
+        return "".join(result)
 
     def encode_batch(self, texts: List[str], max_length: int) -> mx.array:
         """Encode and pad a batch of texts.
@@ -112,7 +110,6 @@ class HashTokenizer:
         Returns:
             List of decoded strings.
         """
-        # Convert to Python list
         ids_list = ids.tolist()
         return [self.decode(seq) for seq in ids_list]
 
@@ -126,3 +123,7 @@ class HashTokenizer:
             String with padding removed.
         """
         return text.replace("<PAD>", "").strip()
+
+
+# Alias for backwards compatibility
+HashTokenizer = ASCIITokenizer

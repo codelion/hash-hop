@@ -1,4 +1,4 @@
-"""Trainer for Indexed Memory Transformer."""
+"""Trainer for Indexed Memory Transformer with autoregressive generation."""
 
 import json
 import time
@@ -15,18 +15,21 @@ from imt.data.tokenizer import HashTokenizer
 from imt.model.imt import IndexedMemoryTransformer
 from imt.training.loss import (
     compute_accuracy,
+    compute_contrastive_embedding_loss,
     compute_retrieval_recall,
-    compute_total_loss,
+    compute_total_loss_with_copy,
 )
 
 
 class IMTTrainer:
-    """Trainer for Indexed Memory Transformer.
+    """Trainer for Indexed Memory Transformer with autoregressive generation.
 
     Handles:
     - Training loop with MLX optimizers
     - Gradient checkpointing for memory efficiency
-    - Periodic evaluation
+    - Teacher forcing for autoregressive generation
+    - Copy mechanism supervision
+    - Periodic evaluation with autoregressive generation
     - Checkpointing
     """
 
@@ -119,7 +122,7 @@ class IMTTrainer:
         model: IndexedMemoryTransformer,
         sample: ChunkedSample,
     ) -> tuple:
-        """Compute loss for a single sample.
+        """Compute loss for a single sample using teacher forcing.
 
         Args:
             model: The model (passed for gradient computation).
@@ -128,26 +131,47 @@ class IMTTrainer:
         Returns:
             Tuple of (loss, metrics_dict).
         """
-        # Forward pass
-        logits, retrieval_scores, chunk_indices, index_keys, all_chunk_scores = model(
+        # Forward pass with teacher forcing
+        logits, copy_attention, copy_gate, retrieval_scores, chunk_indices, index_keys, all_chunk_scores = model(
             sample.chunk_tokens,
             sample.query_tokens,
+            sample.target_tokens,
         )
 
-        # Compute loss (with all_chunk_scores for proper retrieval supervision)
-        loss, metrics = compute_total_loss(
+        # Compute loss with copy mechanism and copy attention supervision
+        lambda_copy = getattr(self.train_config, 'lambda_copy', 0.1)
+        lambda_copy_attn = getattr(self.train_config, 'lambda_copy_attn', 1.0)
+        loss, metrics = compute_total_loss_with_copy(
             logits=logits,
             targets=sample.target_tokens,
+            copy_gate=copy_gate,
+            copy_attention=copy_attention,
+            copy_targets=sample.copy_targets,
             retrieval_scores=retrieval_scores,
             chunk_indices=chunk_indices,
             target_chunk_indices=sample.target_chunk_indices,
             index_keys=index_keys,
-            centroids=model.index_search.centroids,
+            top_k=self.config.retrieval_top_k,
             pad_id=self.tokenizer.pad_id,
             lambda_retrieval=self.train_config.lambda_retrieval,
             lambda_reg=self.train_config.lambda_regularization,
+            lambda_copy=lambda_copy,
+            lambda_copy_attn=lambda_copy_attn,
             all_chunk_scores=all_chunk_scores,
         )
+
+        # Add contrastive embedding loss to bootstrap retrieval learning
+        # This uses the shared embeddings to create a direct supervision signal
+        contrastive_loss = compute_contrastive_embedding_loss(
+            query_tokens=sample.query_tokens,
+            chunk_tokens=sample.chunk_tokens,
+            target_chunk_indices=sample.target_chunk_indices,
+            shared_embedding=model.shared_token_embed.weight,
+            temperature=0.1,
+        )
+        lambda_contrastive = getattr(self.train_config, 'lambda_contrastive', 1.0)
+        loss = loss + lambda_contrastive * contrastive_loss
+        metrics["contrastive_loss"] = float(contrastive_loss)
 
         # Compute additional metrics
         metrics["token_accuracy"] = compute_accuracy(
@@ -181,7 +205,7 @@ class IMTTrainer:
         return metrics
 
     def evaluate(self, num_samples: Optional[int] = None) -> Dict[str, float]:
-        """Evaluate model on held-out samples.
+        """Evaluate model on held-out samples using autoregressive generation.
 
         Args:
             num_samples: Number of samples to evaluate on.
@@ -199,13 +223,21 @@ class IMTTrainer:
         for _ in range(num_samples):
             sample = self.dataset.generate_sample()
 
-            # Forward pass (no gradients)
-            logits, retrieval_scores, chunk_indices, _, _ = self.model(
+            # Use autoregressive generation for evaluation (not teacher forcing)
+            generated, retrieval_scores, chunk_indices = self.model.generate(
                 sample.chunk_tokens,
                 sample.query_tokens,
+                max_length=self.config.max_hash_length,
             )
 
-            # Token-level metrics
+            # Also get teacher forcing logits for token accuracy comparison
+            logits, _, _, _, _, _, _ = self.model(
+                sample.chunk_tokens,
+                sample.query_tokens,
+                sample.target_tokens,
+            )
+
+            # Token-level metrics (from teacher forcing)
             acc = compute_accuracy(logits, sample.target_tokens, self.tokenizer.pad_id)
             recall = compute_retrieval_recall(chunk_indices, sample.target_chunk_indices)
 
@@ -216,19 +248,18 @@ class IMTTrainer:
             total_metrics["token_accuracy"] += acc
             total_metrics["retrieval_recall"] += recall
 
-            # Exact match accuracy (per query)
-            predictions = mx.argmax(logits, axis=-1)
-            for i in range(predictions.shape[0]):
+            # Exact match accuracy (per query) using autoregressive generation
+            for i in range(generated.shape[0]):
                 # Find actual length of target (exclude padding)
                 target_tokens = sample.target_tokens[i].tolist()
                 actual_len = sum(1 for t in target_tokens if t != self.tokenizer.pad_id)
 
-                # Compare only up to actual target length
-                pred_tokens = predictions[i].tolist()[:actual_len]
-                target_tokens = target_tokens[:actual_len]
+                # Get generated tokens (may be different length)
+                gen_tokens = generated[i].tolist()
 
-                pred_str = self.tokenizer.decode(pred_tokens)
-                target_str = self.tokenizer.decode(target_tokens)
+                # Decode and compare
+                pred_str = self.tokenizer.decode(gen_tokens).strip()
+                target_str = self.tokenizer.decode(target_tokens[:actual_len]).strip()
 
                 if pred_str == target_str:
                     exact_matches += 1
@@ -254,6 +285,7 @@ class IMTTrainer:
         print(f"Starting training for {num_steps} steps...")
         print(f"Output directory: {self.output_dir}")
         print(f"Model parameters: {self.model.count_parameters():,}")
+        print(f"Architecture: Autoregressive decoder with copy mechanism")
 
         step_times: List[float] = []
         accumulated_metrics: Dict[str, float] = {}
@@ -290,6 +322,8 @@ class IMTTrainer:
                     f"loss={avg_metrics.get('total_loss', 0):.4f}, "
                     f"gen={avg_metrics.get('generation_loss', 0):.4f}, "
                     f"ret={avg_metrics.get('retrieval_loss', 0):.4f}, "
+                    f"copy_attn={avg_metrics.get('copy_attn_loss', 0):.4f}, "
+                    f"copy_gate={avg_metrics.get('copy_gate_mean', 0):.3f}, "
                     f"acc={avg_metrics.get('token_accuracy', 0):.4f}, "
                     f"recall={avg_metrics.get('retrieval_recall', 0):.4f}, "
                     f"time={avg_time:.2f}s"

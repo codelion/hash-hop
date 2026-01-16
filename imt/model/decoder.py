@@ -1,4 +1,4 @@
-"""Local decoder module that attends to retrieved chunks."""
+"""Autoregressive decoder module with copy mechanism for HashHop retrieval."""
 
 from typing import Optional, Tuple
 
@@ -9,33 +9,30 @@ from imt.config import IMTConfig
 
 
 class DecoderLayer(nn.Module):
-    """Single decoder layer with self-attention and cross-attention.
+    """Single decoder layer with causal self-attention and cross-attention.
 
-    Includes copy-aware cross-attention that helps find query matches in context.
+    Uses standard transformer decoder architecture with:
+    - Causal (masked) self-attention for autoregressive generation
+    - Cross-attention to retrieved context chunks
+    - Feed-forward network
     """
 
-    def __init__(self, config: IMTConfig, use_copy_bias: bool = False) -> None:
+    def __init__(self, config: IMTConfig) -> None:
         """Initialize decoder layer.
 
         Args:
             config: Model configuration.
-            use_copy_bias: Whether to use copy mechanism bias in cross-attention.
         """
         super().__init__()
         self.d_model = config.d_model
-        self.use_copy_bias = use_copy_bias
 
-        # Self-attention
+        # Causal self-attention
         self.norm1 = nn.RMSNorm(config.d_model)
         self.self_attn = nn.MultiHeadAttention(config.d_model, config.decoder_heads)
 
         # Cross-attention to retrieved chunks
         self.norm2 = nn.RMSNorm(config.d_model)
         self.cross_attn = nn.MultiHeadAttention(config.d_model, config.decoder_heads)
-
-        # Copy bias projection (learns to weight token matching)
-        if use_copy_bias:
-            self.copy_gate = nn.Linear(config.d_model, 1)
 
         # Feed-forward
         self.norm3 = nn.RMSNorm(config.d_model)
@@ -51,42 +48,26 @@ class DecoderLayer(nn.Module):
         self,
         x: mx.array,
         context: mx.array,
-        self_attn_mask: Optional[mx.array] = None,
-        copy_bias: Optional[mx.array] = None,
+        causal_mask: Optional[mx.array] = None,
     ) -> mx.array:
         """Forward pass through decoder layer.
 
         Args:
             x: Input tensor of shape (batch, seq_len, d_model).
             context: Context from retrieved chunks of shape (batch, context_len, d_model).
-            self_attn_mask: Optional causal mask for self-attention.
-            copy_bias: Optional copy bias of shape (batch, seq_len, context_len).
+            causal_mask: Causal attention mask of shape (seq_len, seq_len).
 
         Returns:
             Output tensor of shape (batch, seq_len, d_model).
         """
-        # Self-attention
+        # Causal self-attention
         h = self.norm1(x)
-        h = self.self_attn(h, h, h, mask=self_attn_mask)
+        h = self.self_attn(h, h, h, mask=causal_mask)
         x = x + self.dropout(h)
 
         # Cross-attention to retrieved chunks
         h = self.norm2(x)
-        # Note: MLX MultiHeadAttention doesn't support external bias,
-        # so we apply copy bias by modifying context weights
-        if copy_bias is not None and self.use_copy_bias:
-            # Use copy gate to blend copy-biased attention
-            gate = mx.sigmoid(self.copy_gate(x))  # (batch, seq_len, 1)
-            # Apply softmax to copy bias to get copy attention
-            copy_attn = mx.softmax(copy_bias, axis=-1)  # (batch, seq_len, context_len)
-            # Get copy-weighted context
-            copy_context = mx.matmul(copy_attn, context)  # (batch, seq_len, d_model)
-            # Regular cross-attention
-            h = self.cross_attn(h, context, context)
-            # Blend with gated copy
-            h = (1 - gate) * h + gate * copy_context
-        else:
-            h = self.cross_attn(h, context, context)
+        h = self.cross_attn(h, context, context)
         x = x + self.dropout(h)
 
         # Feed-forward
@@ -98,18 +79,20 @@ class DecoderLayer(nn.Module):
 
 
 class LocalDecoder(nn.Module):
-    """Transformer decoder that attends to retrieved chunks.
+    """Autoregressive decoder with copy mechanism for HashHop.
 
     Architecture:
-    1. Self-attention on query tokens
-    2. Cross-attention to retrieved chunk hidden states (with copy bias)
-    3. Feed-forward network
+    1. Input: Query tokens (key to look up) + target tokens (for teacher forcing)
+    2. Causal self-attention on decoder input
+    3. Cross-attention to retrieved chunk hidden states
+    4. Pointer network for copy mechanism
+    5. Blend copy logits with vocabulary logits
 
-    For HashHop, the query is the hash key we're looking up,
-    and we need to produce the final value.
+    The copy mechanism is essential for HashHop because the model needs to
+    extract exact token sequences from the retrieved context.
 
-    Key innovation: Uses token-level copy bias to help attention find
-    where the query appears in context, enabling better value extraction.
+    Training uses teacher forcing: feed ground truth previous tokens.
+    Inference uses autoregressive generation: generate one token at a time.
     """
 
     def __init__(self, config: IMTConfig) -> None:
@@ -120,27 +103,35 @@ class LocalDecoder(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.d_model = config.d_model
+        self.vocab_size = config.vocab_size
 
-        # Query embedding (for the hash we're looking up)
+        # Special token IDs (must match tokenizer)
+        # ASCIITokenizer uses: PAD=0, UNK=1, BOS=2, EOS=3
+        self.bos_id = 2
+        self.eos_id = 3
+        self.pad_id = 0
+
+        # Token embedding for decoder input (will be shared with encoder)
         self.query_embed = nn.Embedding(config.vocab_size, config.d_model)
-        self.query_pos_embed = nn.Embedding(config.max_hash_length, config.d_model)
+        self.pos_embed = nn.Embedding(config.max_hash_length * 2, config.d_model)
 
-        # Decoder layers - first layer uses copy bias to bootstrap attention
-        self.layers = [
-            DecoderLayer(config, use_copy_bias=(i == 0))
-            for i in range(config.decoder_layers)
-        ]
+        # Decoder layers
+        self.layers = [DecoderLayer(config) for _ in range(config.decoder_layers)]
 
-        # Output projection
+        # Output projection for vocabulary logits
         self.norm = nn.RMSNorm(config.d_model)
         self.output_proj = nn.Linear(config.d_model, config.vocab_size)
 
-        # Copy mechanism: learns to find query in context and extract value
-        # Token embedding for computing copy similarity (shared with query_embed)
-        self.copy_scale = mx.array(10.0)  # Learnable scale for copy scores
+        # Copy mechanism components
+        # Projects decoder hidden state to query for copy attention
+        self.copy_query_proj = nn.Linear(config.d_model, config.d_model)
+        # Projects context hidden states to keys for copy attention
+        self.copy_key_proj = nn.Linear(config.d_model, config.d_model)
+        # Gate to blend copy vs vocabulary logits
+        self.copy_gate_proj = nn.Linear(config.d_model, 1)
 
         # Query representation encoder (for retrieval)
-        # Use self-attention to capture sequence patterns, not just mean pooling
         self.query_self_attn = nn.MultiHeadAttention(config.d_model, config.decoder_heads)
         self.query_ff = nn.Sequential(
             nn.Linear(config.d_model, config.decoder_ff_dim),
@@ -150,242 +141,400 @@ class LocalDecoder(nn.Module):
         self.query_norm1 = nn.RMSNorm(config.d_model)
         self.query_norm2 = nn.RMSNorm(config.d_model)
 
-    def _compute_copy_bias(
-        self,
-        query_tokens: mx.array,
-        context_tokens: mx.array,
-    ) -> mx.array:
-        """Compute copy bias based on token matching.
-
-        This helps the model find where the query appears in context
-        and attend to the value that follows.
+    def _create_causal_mask(self, seq_len: int) -> mx.array:
+        """Create causal attention mask.
 
         Args:
-            query_tokens: Query token IDs of shape (batch, query_len).
-            context_tokens: Context token IDs of shape (batch, context_len).
+            seq_len: Sequence length.
 
         Returns:
-            Copy bias of shape (batch, query_len, context_len).
+            Causal mask of shape (seq_len, seq_len) where True means attend.
         """
-        batch_size, query_len = query_tokens.shape
-        _, context_len = context_tokens.shape
+        # Create lower triangular mask (True = can attend, False = cannot)
+        mask = mx.tril(mx.ones((seq_len, seq_len)))
+        # Convert to additive mask: 0 for valid, -inf for invalid
+        return mx.where(mask, 0.0, -1e9)
 
-        # Compute token-level matching: where do query tokens appear in context?
-        # Use embedding similarity instead of exact match for smoother gradients
-        query_embed = self.query_embed(query_tokens)  # (batch, query_len, d_model)
-        context_embed = self.query_embed(context_tokens)  # (batch, context_len, d_model)
-
-        # Normalize for cosine similarity
-        query_norm = query_embed / (mx.linalg.norm(query_embed, axis=-1, keepdims=True) + 1e-8)
-        context_norm = context_embed / (mx.linalg.norm(context_embed, axis=-1, keepdims=True) + 1e-8)
-
-        # Token similarity: (batch, query_len, context_len)
-        token_sim = mx.matmul(query_norm, context_norm.transpose(0, 2, 1))
-
-        # For each query position i, we want to attend to context position j
-        # where the query string STARTS, then offset to get the value
-        # The pattern is: query matches at position j -> value starts at j + query_len + 4
-        # (4 for " = '" delimiter)
-
-        # Create offset attention: for each query position i, attend to
-        # context positions where we expect the i-th character of the VALUE
-        # This is complex, so we'll use a simpler approach:
-        # Just scale the token similarity to help attention focus
-
-        return token_sim * self.copy_scale
-
-    def _find_query_in_context(
+    def _prepare_decoder_input(
         self,
         query_tokens: mx.array,
-        context_tokens: mx.array,
-        pad_id: int = 0,
+        target_tokens: mx.array,
     ) -> mx.array:
-        """Find where query appears in context and return value-aligned attention.
+        """Prepare decoder input by concatenating query and shifted target.
 
-        Uses full query matching (not just first character) to find exact location.
+        For training with teacher forcing, we input:
+        [query_tokens, BOS, target[0], target[1], ..., target[n-1]]
+
+        And predict:
+        [target[0], target[1], ..., target[n], EOS] (at positions after query)
 
         Args:
-            query_tokens: Query tokens (batch, query_len).
-            context_tokens: Context tokens (batch, context_len).
-            pad_id: Padding token ID to ignore.
+            query_tokens: Query hash tokens (batch, query_len).
+            target_tokens: Target answer tokens (batch, target_len).
 
         Returns:
-            Attention bias of shape (batch, query_len, context_len) that attends
-            to the VALUE positions (offset from query match).
+            Decoder input tokens (batch, query_len + target_len).
         """
-        batch_size, padded_query_len = query_tokens.shape
-        _, context_len = context_tokens.shape
+        batch_size = query_tokens.shape[0]
 
-        # Compute actual query length per batch item (ignoring padding)
-        # For simplicity, use the first batch item's actual length
-        # (queries in a batch should have same length)
-        non_pad_mask = (query_tokens[0] != pad_id).astype(mx.int32)
-        actual_query_len = int(mx.sum(non_pad_mask).item())
+        # Create BOS token
+        bos = mx.full((batch_size, 1), self.bos_id, dtype=mx.int32)
 
-        # If all tokens are padding, fall back to padded length
-        if actual_query_len == 0:
-            actual_query_len = padded_query_len
+        # Shift target: [BOS, target[:-1]]
+        shifted_target = mx.concatenate([bos, target_tokens[:, :-1]], axis=1)
 
-        # For simplified format KEY>VALUE, the value starts at offset actual_query_len+1
-        # from where the key starts (after the '>' delimiter)
-        offset = actual_query_len + 1  # +1 for '>'
+        # Concatenate query with shifted target
+        # The model sees the query first, then generates the answer
+        return mx.concatenate([query_tokens, shifted_target], axis=1)
 
-        # Match ALL actual query characters (not padding)
-        # For each starting position j in context, check if query matches
-        # query_tokens: (batch, query_len)
-        # context_tokens: (batch, context_len)
+    def _compute_copy_attention(
+        self,
+        hidden: mx.array,
+        context: mx.array,
+        context_token_ids: mx.array = None,
+        query_token_ids: mx.array = None,
+        output_position: int = None,
+    ) -> mx.array:
+        """Compute copy attention over context.
 
-        # Create match scores for each possible starting position
-        # match_score[j] = sum over i of (query[i] == context[j+i])
-        match_scores = mx.zeros((batch_size, context_len))
+        The copy mechanism needs to attend to VALUE positions in context where
+        format is KEY>VALUE. We help the model by:
+        1. Computing learned attention over context positions
+        2. Adding bias towards positions immediately after where KEY appears
 
-        for i in range(actual_query_len):
-            # Get query character i
-            query_char = query_tokens[:, i:i+1]  # (batch, 1)
+        Args:
+            hidden: Decoder hidden states (batch, seq_len, d_model).
+            context: Context hidden states (batch, context_len, d_model).
+            context_token_ids: Token IDs of context (batch, context_len).
+            query_token_ids: Token IDs of query (batch, query_len).
+            output_position: Current output position index for single-step generation.
 
-            # Check if it matches context at position j+i
-            # We need context[:, j+i] for all j
-            # This is context shifted left by i positions
-            if i < context_len:
-                shifted_context = mx.concatenate([
-                    context_tokens[:, i:],
-                    mx.zeros((batch_size, i), dtype=context_tokens.dtype)
-                ], axis=1)  # (batch, context_len)
-            else:
-                shifted_context = mx.zeros((batch_size, context_len), dtype=context_tokens.dtype)
+        Returns:
+            Copy attention weights (batch, seq_len, context_len).
+        """
+        batch_size, seq_len, _ = hidden.shape
+        context_len = context.shape[1]
 
-            # Match: query_char == shifted_context
-            char_match = (shifted_context == query_char).astype(mx.float32)
+        # Project to query and key spaces
+        query = self.copy_query_proj(hidden)  # (batch, seq_len, d_model)
+        key = self.copy_key_proj(context)  # (batch, context_len, d_model)
 
-            # Add to match scores (positions where query could start)
-            match_scores = match_scores + char_match
+        # Compute attention scores with scaled dot-product
+        d_k = self.d_model ** 0.5
+        scores = mx.matmul(query, key.transpose(0, 2, 1)) / d_k  # (batch, seq_len, context_len)
 
-        # Perfect match has score == actual_query_len
-        # Use soft threshold: high score for positions close to actual_query_len
-        perfect_match = (match_scores >= actual_query_len - 0.5).astype(mx.float32)
+        # Add positional bias based on query token locations
+        # The VALUE we want to copy comes AFTER the KEY in context
+        if context_token_ids is not None and query_token_ids is not None:
+            query_len = query_token_ids.shape[1]
 
-        # Now create attention for value positions
-        # For output position i, attend to j+offset+i where j is the match position
-        attention_rows = []
-        for i in range(padded_query_len):
-            # For positions beyond actual query, attend to nothing meaningful
-            if i < actual_query_len:
-                shift = offset + i
-                if shift < context_len and shift > 0:
-                    padded = mx.concatenate([
-                        mx.zeros((batch_size, shift)),
-                        perfect_match[:, :-shift]
+            # For each context position, check if it matches any query token
+            # query_token_ids: (batch, query_len)
+            # context_token_ids: (batch, context_len)
+            query_expanded = query_token_ids[:, :, None]  # (batch, query_len, 1)
+            context_expanded = context_token_ids[:, None, :]  # (batch, 1, context_len)
+
+            # Match matrix: (batch, query_len, context_len)
+            matches = (query_expanded == context_expanded).astype(mx.float32)
+
+            # Find where query sequence starts in context
+            # If context[i:i+query_len] matches query, that's where KEY is
+            # VALUE starts at position i + query_len + 1 (after the '>' separator)
+
+            # Simplified: for each output position j, boost attention to positions
+            # that are offset from query token matches by (query_len + 1 + j)
+            # This means output position 0 attends to first char of VALUE,
+            # output position 1 attends to second char, etc.
+
+            # Find where the FULL query sequence matches in context
+            # This is more reliable than just matching the first token
+            # matches shape: (batch, query_len, context_len)
+
+            # For position p in context, compute how many consecutive tokens match
+            # A full match at position p means matches[:, 0, p] AND matches[:, 1, p+1] AND ...
+
+            # We'll compute a "sequence match score" at each context position
+            # sequence_match[p] = product of matches at positions p, p+1, ..., p+query_len-1
+            # But products are hard with gradients, so use sum instead
+
+            # Sum of matches across query positions, shifted appropriately
+            # If context[p:p+query_len] matches query, then sequence_match[p] = query_len
+            query_len_actual = min(query_len, 4)  # Only check first 4 chars (key length)
+
+            sequence_match = mx.zeros((batch_size, context_len))
+            for q_pos in range(query_len_actual):
+                # Shift matches[:, q_pos, :] left by q_pos positions
+                if q_pos < context_len:
+                    shifted_match = mx.concatenate([
+                        matches[:, q_pos, q_pos:],
+                        mx.zeros((batch_size, q_pos))
                     ], axis=1)
-                elif shift == 0:
-                    padded = perfect_match
+                    sequence_match = sequence_match + shifted_match
+
+            # Normalize to [0, 1] range
+            sequence_match = sequence_match / query_len_actual
+
+            # Positions with high sequence_match (~1) are where the query starts
+            # The VALUE starts at (query_start + query_len + 1)
+            # query_len here is the actual KEY length (4 chars typically)
+            value_offset = query_len_actual + 1  # +1 for '>' separator
+
+            # Build position bias list for each output position
+            # If output_position is provided (single-step generation), only compute
+            # bias for that specific position
+            if output_position is not None:
+                # During generation: only one position, use explicit output_position
+                total_offset = value_offset + output_position
+
+                if total_offset < context_len and output_position < self.config.max_hash_length:
+                    zeros_before = mx.zeros((batch_size, total_offset))
+                    match_truncated = sequence_match[:, :context_len - total_offset]
+                    position_bias = mx.concatenate([zeros_before, match_truncated], axis=1)
                 else:
-                    padded = mx.zeros((batch_size, context_len))
+                    position_bias = mx.zeros((batch_size, context_len))
+
+                # Expand to (batch, 1, context_len) for single-position
+                position_bias = position_bias[:, None, :]
             else:
-                # Padding position - uniform attention (or zeros)
-                padded = mx.zeros((batch_size, context_len))
-            attention_rows.append(padded[:, None, :])
+                # During training: compute for all output positions
+                bias_list = []
+                for out_pos in range(seq_len):
+                    # Total offset: where value starts + output position
+                    total_offset = value_offset + out_pos
 
-        value_attention = mx.concatenate(attention_rows, axis=1)
+                    if total_offset < context_len and out_pos < self.config.max_hash_length:
+                        # Shift sequence_match by total_offset positions
+                        zeros_before = mx.zeros((batch_size, total_offset))
+                        match_truncated = sequence_match[:, :context_len - total_offset]
+                        shifted = mx.concatenate([zeros_before, match_truncated], axis=1)
+                    else:
+                        shifted = mx.zeros((batch_size, context_len))
 
-        # Scale to get strong attention
-        return value_attention * 100.0
+                    bias_list.append(shifted)
+
+                # Stack to create (batch, seq_len, context_len)
+                position_bias = mx.stack(bias_list, axis=1)
+
+            # Add position bias to scores - use strong bias
+            scores = scores + 5.0 * position_bias
+
+        # Softmax over context positions
+        return mx.softmax(scores, axis=-1)
+
+    def _scatter_copy_logits(
+        self,
+        copy_attention: mx.array,
+        context_token_ids: mx.array,
+    ) -> mx.array:
+        """Convert copy attention to vocabulary logits in log space.
+
+        For each output position, scatter the copy attention weights
+        to their corresponding vocabulary indices using MAX (not sum).
+
+        Using max instead of sum prevents common tokens from being artificially
+        boosted when they appear multiple times in context.
+
+        CRITICAL: We convert to log space so copy_logits have similar scale
+        to vocab_logits. Without this, the blending doesn't work properly
+        because attention weights are in [0,1] while vocab_logits are unbounded.
+
+        Args:
+            copy_attention: Copy attention (batch, seq_len, context_len).
+            context_token_ids: Token IDs of context (batch, context_len).
+
+        Returns:
+            Copy logits (batch, seq_len, vocab_size) in log space.
+        """
+        batch_size, seq_len, context_len = copy_attention.shape
+
+        # Build mask for each vocab token: (batch, context_len, vocab_size)
+        # vocab_indices: (1, 1, vocab_size)
+        vocab_indices = mx.arange(self.vocab_size)[None, None, :]
+        # context_ids_expanded: (batch, context_len, 1)
+        context_ids_expanded = context_token_ids[:, :, None]
+        # mask: 1.0 where context position has this vocab token, 0.0 otherwise
+        mask = (context_ids_expanded == vocab_indices).astype(mx.float32)
+
+        # Expand copy_attention for broadcasting: (batch, seq_len, context_len, 1)
+        attn_expanded = copy_attention[:, :, :, None]
+
+        # Expand mask: (batch, 1, context_len, vocab_size)
+        mask_expanded = mask[:, None, :, :]
+
+        # Mask attention: set to -inf where token doesn't match
+        # This ensures max only considers positions with matching token
+        # attn_expanded: (batch, seq_len, context_len, 1)
+        # mask_expanded: (batch, 1, context_len, vocab_size)
+        # Broadcasting gives: (batch, seq_len, context_len, vocab_size)
+        masked_attn = mx.where(
+            mask_expanded > 0,
+            attn_expanded,
+            mx.array(-1e9)
+        )
+
+        # Take max over context positions: (batch, seq_len, vocab_size)
+        max_attn = mx.max(masked_attn, axis=2)
+
+        # Convert to log space with small epsilon to avoid log(0)
+        # This ensures copy_logits have similar scale to vocab_logits
+        # Tokens with no match in context will have log(-1e9) = very negative
+        copy_logits = mx.log(mx.maximum(max_attn, 1e-10))
+
+        return copy_logits
 
     def __call__(
         self,
         query_tokens: mx.array,
         retrieved_chunks: mx.array,
-        retrieval_scores: Optional[mx.array] = None,
-        context_tokens: Optional[mx.array] = None,
-    ) -> Tuple[mx.array, mx.array]:
-        """Decode the answer given query and retrieved chunks.
+        target_tokens: mx.array,
+        chunk_token_ids: mx.array,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Forward pass with teacher forcing for training.
 
         Args:
-            query_tokens: Hash tokens to look up of shape (batch, query_len).
-            retrieved_chunks: Retrieved chunk hidden states of shape
+            query_tokens: Query hash tokens (batch, query_len).
+            retrieved_chunks: Retrieved chunk hidden states
                 (batch, top_k, chunk_size, d_model).
-            retrieval_scores: Optional retrieval scores of shape (batch, top_k)
-                for weighted attention.
-            context_tokens: Optional context token IDs of shape (batch, context_len)
-                for copy mechanism.
+            target_tokens: Target answer tokens (batch, target_len).
+            chunk_token_ids: Token IDs of retrieved chunks
+                (batch, top_k, chunk_size) for copy mechanism.
 
         Returns:
-            logits: Output logits of shape (batch, query_len, vocab_size).
-            query_repr: Query representation of shape (batch, d_model) for retrieval.
+            logits: Output logits (batch, target_len, vocab_size).
+            copy_attention: Copy attention weights (batch, target_len, context_len).
+            copy_gate: Copy gate values (batch, target_len, 1).
+        """
+        batch_size, query_len = query_tokens.shape
+        _, top_k, chunk_size, d_model = retrieved_chunks.shape
+        target_len = target_tokens.shape[1]
+
+        # Prepare decoder input: [query, BOS, target[:-1]]
+        decoder_input = self._prepare_decoder_input(query_tokens, target_tokens)
+        total_len = decoder_input.shape[1]
+
+        # Embed decoder input
+        positions = mx.arange(total_len)
+        x = self.query_embed(decoder_input) + self.pos_embed(positions)
+
+        # Flatten retrieved chunks for cross-attention
+        context = retrieved_chunks.reshape(batch_size, top_k * chunk_size, d_model)
+        context_tokens = chunk_token_ids.reshape(batch_size, top_k * chunk_size)
+
+        # Create causal mask for the target portion
+        # Query tokens can see each other, but target tokens are causal
+        causal_mask = self._create_causal_mask(total_len)
+
+        # Process through decoder layers
+        for layer in self.layers:
+            x = layer(x, context, causal_mask)
+
+        x = self.norm(x)
+
+        # Extract only the target portion (after query tokens)
+        target_hidden = x[:, query_len:, :]  # (batch, target_len, d_model)
+
+        # Vocabulary logits
+        vocab_logits = self.output_proj(target_hidden)  # (batch, target_len, vocab_size)
+
+        # Copy mechanism with token-based alignment
+        # Pass query_tokens to help align attention to positions after the query
+        copy_attention = self._compute_copy_attention(
+            target_hidden, context,
+            context_token_ids=context_tokens,
+            query_token_ids=query_tokens,
+        )
+        copy_logits = self._scatter_copy_logits(copy_attention, context_tokens)
+
+        # Copy gate: probability of copying vs generating from vocabulary
+        copy_gate = mx.sigmoid(self.copy_gate_proj(target_hidden))  # (batch, target_len, 1)
+
+        # Blend copy and vocab logits
+        # Higher copy_gate = more copying from context
+        final_logits = copy_gate * copy_logits + (1 - copy_gate) * vocab_logits
+
+        return final_logits, copy_attention, copy_gate
+
+    def generate(
+        self,
+        query_tokens: mx.array,
+        retrieved_chunks: mx.array,
+        chunk_token_ids: mx.array,
+        max_length: int = 20,
+    ) -> mx.array:
+        """Autoregressive generation for inference.
+
+        Args:
+            query_tokens: Query hash tokens (batch, query_len).
+            retrieved_chunks: Retrieved chunk hidden states
+                (batch, top_k, chunk_size, d_model).
+            chunk_token_ids: Token IDs of retrieved chunks
+                (batch, top_k, chunk_size).
+            max_length: Maximum generation length.
+
+        Returns:
+            Generated token IDs (batch, gen_len).
         """
         batch_size, query_len = query_tokens.shape
         _, top_k, chunk_size, d_model = retrieved_chunks.shape
 
-        # Embed query
-        positions = mx.arange(query_len)
-        x = self.query_embed(query_tokens) + self.query_pos_embed(positions)
-
-        # Flatten retrieved chunks for cross-attention
-        # (batch, top_k * chunk_size, d_model)
+        # Flatten context
         context = retrieved_chunks.reshape(batch_size, top_k * chunk_size, d_model)
+        context_tokens = chunk_token_ids.reshape(batch_size, top_k * chunk_size)
 
-        # Compute copy bias if context tokens are provided
-        copy_bias = None
-        if context_tokens is not None:
-            # Use explicit query location finding for better value extraction
-            copy_bias = self._find_query_in_context(query_tokens, context_tokens)
+        # Start with BOS token
+        generated = mx.full((batch_size, 1), self.bos_id, dtype=mx.int32)
 
-        # Process through decoder layers
-        for layer in self.layers:
-            x = layer(x, context, copy_bias=copy_bias)
+        for step in range(max_length):
+            # Prepare input: [query, generated_so_far]
+            decoder_input = mx.concatenate([query_tokens, generated], axis=1)
+            total_len = decoder_input.shape[1]
 
-        x = self.norm(x)
+            # Embed
+            positions = mx.arange(total_len)
+            x = self.query_embed(decoder_input) + self.pos_embed(positions)
 
-        # Standard vocabulary logits
-        vocab_logits = self.output_proj(x)  # (batch, query_len, vocab_size)
+            # Causal mask
+            causal_mask = self._create_causal_mask(total_len)
 
-        # If we have context tokens, compute copy logits
-        if context_tokens is not None:
-            # Pointer mechanism: compute attention over context positions
-            # Then create logits by scattering attention to vocabulary positions
-            pointer_query = x  # (batch, query_len, d_model)
+            # Process through layers
+            for layer in self.layers:
+                x = layer(x, context, causal_mask)
 
-            # Compute attention scores over context
-            # Use the copy_bias as attention (already computed where to look)
-            copy_attn = mx.softmax(copy_bias, axis=-1)  # (batch, query_len, context_len)
+            x = self.norm(x)
 
-            # Create copy logits: for each vocab token, sum attention over
-            # context positions that have that token
-            batch_size, query_len, _ = vocab_logits.shape
-            _, context_len = context_tokens.shape
-            vocab_size = vocab_logits.shape[-1]
+            # Get logits for last position only
+            last_hidden = x[:, -1:, :]  # (batch, 1, d_model)
 
-            # Initialize copy logits
-            # For each (batch, query_pos), we want to compute:
-            # copy_logits[v] = sum over j where context_tokens[j] == v of copy_attn[j]
-            # This is: scatter_add of copy_attn based on context_tokens
-            copy_logits = mx.zeros_like(vocab_logits)
+            # Vocab logits
+            vocab_logits = self.output_proj(last_hidden)
 
-            # Scatter attention to vocabulary positions
-            # context_tokens: (batch, context_len) - vocab IDs
-            # copy_attn: (batch, query_len, context_len) - attention weights
-            # For each context position j, add its attention to copy_logits[context_tokens[j]]
+            # Copy mechanism for last position
+            # Pass token IDs for position bias AND the current output position
+            # step=0 means we're generating output position 0, etc.
+            copy_attention = self._compute_copy_attention(
+                last_hidden, context,
+                context_token_ids=context_tokens,
+                query_token_ids=query_tokens,
+                output_position=step,  # Critical: tells position bias which char to target
+            )
+            copy_logits = self._scatter_copy_logits(copy_attention, context_tokens)
+            copy_gate = mx.sigmoid(self.copy_gate_proj(last_hidden))
 
-            # Use one-hot encoding to scatter
-            context_onehot = mx.eye(vocab_size)[context_tokens]  # (batch, context_len, vocab_size)
-            # Multiply attention by one-hot and sum over context positions
-            # copy_attn: (batch, query_len, context_len)
-            # context_onehot: (batch, context_len, vocab_size)
-            # Result: (batch, query_len, vocab_size)
-            copy_logits = mx.matmul(copy_attn, context_onehot)
+            # Blend
+            final_logits = copy_gate * copy_logits + (1 - copy_gate) * vocab_logits
 
-            # Convert from probability to logits scale
-            copy_logits = mx.log(copy_logits + 1e-10)
+            # Greedy decoding: pick most likely token
+            next_token = mx.argmax(final_logits[:, -1, :], axis=-1, keepdims=True)
 
-            # Blend vocabulary and copy logits
-            # Use a simple average for now (could learn a gate)
-            logits = vocab_logits + copy_logits
-        else:
-            logits = vocab_logits
+            # Append to generated
+            generated = mx.concatenate([generated, next_token], axis=1)
 
-        # Query representation (mean pool) for retrieval
-        query_repr = mx.mean(x, axis=1)
+            # Stop if all sequences have generated EOS
+            if mx.all(next_token.flatten() == self.eos_id):
+                break
 
-        return logits, query_repr
+        # Remove BOS token
+        return generated[:, 1:]
 
     def get_query_representation(self, query_tokens: mx.array) -> mx.array:
         """Get query representation for retrieval (without full decoding).
@@ -400,7 +549,7 @@ class LocalDecoder(nn.Module):
             Query representation of shape (batch, d_model).
         """
         positions = mx.arange(query_tokens.shape[1])
-        x = self.query_embed(query_tokens) + self.query_pos_embed(positions)
+        x = self.query_embed(query_tokens) + self.pos_embed(positions)
 
         # Self-attention layer to capture sequence patterns
         h = self.query_norm1(x)
@@ -412,5 +561,5 @@ class LocalDecoder(nn.Module):
         h = self.query_ff(h)
         x = x + h
 
-        # Now pool - the representations are more distinctive after attention
+        # Pool to get fixed-size representation
         return mx.mean(x, axis=1)

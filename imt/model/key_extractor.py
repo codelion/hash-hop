@@ -11,9 +11,12 @@ from imt.config import IMTConfig
 class IndexKeyExtractor(nn.Module):
     """Learns to extract searchable keys from chunk hidden states.
 
-    Uses cross-attention with learned query vectors to identify
-    the most important positions in each chunk for indexing.
-    For HashHop, this learns to attend to hash string positions.
+    Uses a combination of:
+    1. Learned cross-attention with query vectors for position-specific keys
+    2. Global pooling for content-based keys (helps with query-key alignment)
+
+    The global component uses the same character embeddings as queries,
+    making it easier to learn retrieval from scratch.
     """
 
     def __init__(self, config: IMTConfig) -> None:
@@ -43,6 +46,10 @@ class IndexKeyExtractor(nn.Module):
         self.key_proj = nn.Linear(config.d_model, config.index_dim)
         self.value_proj = nn.Linear(config.d_model, config.index_dim)
 
+        # Global content key - single key that captures overall chunk content
+        # This helps with initial alignment since it pools over all positions
+        self.global_key_proj = nn.Linear(config.d_model, config.index_dim)
+
         self.norm = nn.RMSNorm(config.d_model)
 
     def __call__(
@@ -56,26 +63,46 @@ class IndexKeyExtractor(nn.Module):
 
         Returns:
             keys: Searchable keys of shape (batch, keys_per_chunk, index_dim).
+                First key is global content key, rest are position-specific.
             values: Associated values of shape (batch, keys_per_chunk, index_dim).
             attention_weights: Attention weights of shape (batch, keys_per_chunk, chunk_size)
                 for interpretability.
         """
         batch_size = chunk_hidden.shape[0]
 
-        # Expand key queries for batch
-        queries = mx.broadcast_to(
-            self.key_queries[None, :, :],
-            (batch_size, self.keys_per_chunk, self.d_model),
-        )
+        # Global content key - mean pool over all positions
+        # This creates a key that captures the overall content of the chunk
+        global_content = mx.mean(chunk_hidden, axis=1)  # (batch, d_model)
+        global_key = self.global_key_proj(global_content)  # (batch, index_dim)
+        global_key = global_key[:, None, :]  # (batch, 1, index_dim)
 
-        # Cross-attend to chunk hidden states
-        extracted, attn_weights = self._cross_attend_with_weights(queries, chunk_hidden)
+        # Position-specific keys via cross-attention (for remaining keys)
+        if self.keys_per_chunk > 1:
+            # Expand key queries for batch
+            queries = mx.broadcast_to(
+                self.key_queries[None, :self.keys_per_chunk-1, :],
+                (batch_size, self.keys_per_chunk - 1, self.d_model),
+            )
 
-        extracted = self.norm(extracted)
+            # Cross-attend to chunk hidden states
+            extracted, attn_weights = self._cross_attend_with_weights(queries, chunk_hidden)
+            extracted = self.norm(extracted)
 
-        # Project to index space
-        keys = self.key_proj(extracted)
-        values = self.value_proj(extracted)
+            # Project to index space
+            position_keys = self.key_proj(extracted)
+            position_values = self.value_proj(extracted)
+
+            # Combine global and position keys
+            keys = mx.concatenate([global_key, position_keys], axis=1)
+            values = mx.concatenate([global_key, position_values], axis=1)
+
+            # Add uniform attention for global key
+            uniform_attn = mx.ones((batch_size, 1, chunk_hidden.shape[1])) / chunk_hidden.shape[1]
+            attn_weights = mx.concatenate([uniform_attn, attn_weights], axis=1)
+        else:
+            keys = global_key
+            values = global_key
+            attn_weights = mx.ones((batch_size, 1, chunk_hidden.shape[1])) / chunk_hidden.shape[1]
 
         return keys, values, attn_weights
 

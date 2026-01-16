@@ -19,17 +19,21 @@ class IndexedMemoryTransformer(nn.Module):
     1. ChunkEncoder: Process each 512-token chunk independently
     2. IndexKeyExtractor: Extract searchable keys from chunks
     3. LearnedIndexSearch: Build differentiable index, perform retrieval
-    4. LocalDecoder: Attend to retrieved chunks, produce answer
+    4. LocalDecoder: Autoregressive decoder with copy mechanism
+
+    Key design: Encoder and decoder share the same token embedding.
+    This helps with query-key alignment since the same characters
+    produce the same initial representations.
 
     Training flow:
     - Encode all chunks (can be batched)
     - Extract keys from all chunks
     - Build index
-    - For each query: retrieve -> decode -> loss
+    - For each query: retrieve -> decode with teacher forcing -> loss
 
     Inference flow:
     - Pre-encode and index all chunks (one-time)
-    - For each query: retrieve -> decode
+    - For each query: retrieve -> autoregressive decode
     """
 
     def __init__(self, config: IMTConfig) -> None:
@@ -41,10 +45,19 @@ class IndexedMemoryTransformer(nn.Module):
         super().__init__()
         self.config = config
 
+        # Shared token embedding for encoder and decoder
+        # This helps with query-key alignment
+        self.shared_token_embed = nn.Embedding(config.vocab_size, config.d_model)
+
         self.encoder = ChunkEncoder(config)
         self.key_extractor = IndexKeyExtractor(config)
         self.index_search = LearnedIndexSearch(config)
         self.decoder = LocalDecoder(config)
+
+        # Share embeddings: make encoder and decoder use the same token embedding
+        # This is critical for learning query-key alignment from scratch
+        self.encoder.token_embed = self.shared_token_embed
+        self.decoder.query_embed = self.shared_token_embed
 
     def encode_chunks(
         self,
@@ -111,81 +124,107 @@ class IndexedMemoryTransformer(nn.Module):
     def forward_query(
         self,
         query_tokens: mx.array,
+        target_tokens: mx.array,
         index: Dict[str, Any],
-        chunk_tokens: Optional[mx.array] = None,
-    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
-        """Process queries against the index.
+        chunk_tokens: mx.array,
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+        """Process queries against the index with teacher forcing.
 
         Args:
             query_tokens: Query hash tokens of shape (batch, query_len).
+            target_tokens: Target answer tokens of shape (batch, target_len).
             index: Index built by build_index().
-            chunk_tokens: Optional chunk tokens of shape (num_chunks, chunk_size)
-                for copy mechanism.
+            chunk_tokens: Chunk token IDs (num_chunks, chunk_size) for
+                embedding-based retrieval boosting and copy mechanism.
 
         Returns:
-            logits: Output logits of shape (batch, query_len, vocab_size).
+            logits: Output logits of shape (batch, target_len, vocab_size).
+            copy_attention: Copy attention weights (batch, target_len, context_len).
+            copy_gate: Copy gate values (batch, target_len, 1).
             retrieval_scores: Retrieval scores of shape (batch, top_k).
             chunk_indices: Retrieved chunk indices of shape (batch, top_k).
             all_chunk_scores: Scores for ALL chunks (batch, num_chunks) for supervision.
         """
+        batch_size = query_tokens.shape[0]
+
         # Initial query embedding for retrieval
         query_repr = self.decoder.get_query_representation(query_tokens)
 
-        # Retrieve relevant chunks (pass query/chunk tokens for token-matching boost)
+        # Compute raw embedding means for embedding-based retrieval boost
+        query_embed = self.shared_token_embed(query_tokens)  # (batch, query_len, d_model)
+        query_embed_mean = mx.mean(query_embed, axis=1)  # (batch, d_model)
+
+        chunk_embed = self.shared_token_embed(chunk_tokens)  # (num_chunks, chunk_size, d_model)
+        chunk_embed_means = mx.mean(chunk_embed, axis=1)  # (num_chunks, d_model)
+
+        # Retrieve relevant chunks with embedding boost
         retrieved_hidden, retrieval_scores, chunk_indices, all_chunk_scores = (
             self.index_search.search(
                 query_repr, index,
-                query_tokens=query_tokens,
-                chunk_tokens=chunk_tokens,
+                query_embed_mean=query_embed_mean,
+                chunk_embed_means=chunk_embed_means
             )
         )
 
-        # Get context tokens for copy mechanism if chunk_tokens provided
-        context_tokens = None
-        if chunk_tokens is not None:
-            batch_size = query_tokens.shape[0]
-            top_k = chunk_indices.shape[1]
-            chunk_size = chunk_tokens.shape[1]
+        # Get chunk token IDs for retrieved chunks (for copy mechanism)
+        # chunk_indices: (batch, top_k)
+        top_k = chunk_indices.shape[1]
+        chunk_size = chunk_tokens.shape[1]
 
-            # Gather tokens for retrieved chunks
-            # chunk_indices: (batch, top_k)
-            # chunk_tokens: (num_chunks, chunk_size)
-            # We need: (batch, top_k * chunk_size)
-            retrieved_tokens = []
-            for i in range(batch_size):
-                batch_tokens = []
-                for j in range(top_k):
-                    idx = int(chunk_indices[i, j])
-                    batch_tokens.append(chunk_tokens[idx])
-                # Stack and flatten: (top_k, chunk_size) -> (top_k * chunk_size,)
-                batch_tokens = mx.concatenate(batch_tokens, axis=0)
-                retrieved_tokens.append(batch_tokens)
-            context_tokens = mx.stack(retrieved_tokens)  # (batch, top_k * chunk_size)
+        # Gather retrieved chunk token IDs
+        retrieved_chunk_tokens = self._gather_chunk_tokens(chunk_tokens, chunk_indices)
+        # Shape: (batch, top_k, chunk_size)
 
-        # Decode answer
-        logits, _ = self.decoder(
-            query_tokens, retrieved_hidden, retrieval_scores, context_tokens
+        # Decode answer using teacher forcing with copy mechanism
+        logits, copy_attention, copy_gate = self.decoder(
+            query_tokens, retrieved_hidden, target_tokens, retrieved_chunk_tokens
         )
 
-        return logits, retrieval_scores, chunk_indices, all_chunk_scores
+        return logits, copy_attention, copy_gate, retrieval_scores, chunk_indices, all_chunk_scores
+
+    def _gather_chunk_tokens(
+        self,
+        chunk_tokens: mx.array,
+        indices: mx.array,
+    ) -> mx.array:
+        """Gather chunk tokens by indices.
+
+        Args:
+            chunk_tokens: All chunk tokens of shape (num_chunks, chunk_size).
+            indices: Indices to gather of shape (batch, top_k).
+
+        Returns:
+            Gathered chunk tokens of shape (batch, top_k, chunk_size).
+        """
+        batch_size, top_k = indices.shape
+        chunk_size = chunk_tokens.shape[1]
+
+        flat_indices = indices.reshape(-1)
+        gathered = mx.take(chunk_tokens, flat_indices, axis=0)
+
+        return gathered.reshape(batch_size, top_k, chunk_size)
 
     def __call__(
         self,
         chunk_tokens: mx.array,
         query_tokens: mx.array,
+        target_tokens: mx.array,
         precomputed_index: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
-        """Full forward pass.
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+        """Full forward pass with teacher forcing.
 
         If precomputed_index is provided, skip encoding phase.
 
         Args:
             chunk_tokens: All chunk tokens of shape (num_chunks, chunk_size).
             query_tokens: Query hash tokens of shape (batch, query_len).
+            target_tokens: Target answer tokens of shape (batch, target_len).
             precomputed_index: Optional pre-built index to skip encoding.
 
         Returns:
-            logits: Output logits of shape (batch, query_len, vocab_size).
+            logits: Output logits of shape (batch, target_len, vocab_size).
+            copy_attention: Copy attention weights (batch, target_len, context_len).
+            copy_gate: Copy gate values (batch, target_len, 1).
             retrieval_scores: Retrieval scores of shape (batch, top_k).
             chunk_indices: Retrieved chunk indices of shape (batch, top_k).
             index_keys: Index keys of shape (num_chunks, keys_per_chunk, index_dim).
@@ -199,12 +238,68 @@ class IndexedMemoryTransformer(nn.Module):
             index = precomputed_index
             index_keys = index["keys"]
 
-        # Process queries (pass chunk_tokens for copy mechanism)
-        logits, retrieval_scores, chunk_indices, all_chunk_scores = self.forward_query(
-            query_tokens, index, chunk_tokens
+        # Process queries with teacher forcing and copy mechanism
+        logits, copy_attention, copy_gate, retrieval_scores, chunk_indices, all_chunk_scores = (
+            self.forward_query(query_tokens, target_tokens, index, chunk_tokens)
         )
 
-        return logits, retrieval_scores, chunk_indices, index_keys, all_chunk_scores
+        return logits, copy_attention, copy_gate, retrieval_scores, chunk_indices, index_keys, all_chunk_scores
+
+    def generate(
+        self,
+        chunk_tokens: mx.array,
+        query_tokens: mx.array,
+        precomputed_index: Optional[Dict[str, Any]] = None,
+        max_length: int = 20,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Generate answer autoregressively (for inference).
+
+        Args:
+            chunk_tokens: All chunk tokens of shape (num_chunks, chunk_size).
+            query_tokens: Query hash tokens of shape (batch, query_len).
+            precomputed_index: Optional pre-built index to skip encoding.
+            max_length: Maximum generation length.
+
+        Returns:
+            generated: Generated token IDs of shape (batch, gen_len).
+            retrieval_scores: Retrieval scores of shape (batch, top_k).
+            chunk_indices: Retrieved chunk indices of shape (batch, top_k).
+        """
+        if precomputed_index is None:
+            # Encode and index
+            chunk_hidden, index_keys, index_values = self.encode_chunks(chunk_tokens)
+            index = self.build_index(chunk_hidden, index_keys, index_values)
+        else:
+            index = precomputed_index
+
+        # Get query representation for retrieval
+        query_repr = self.decoder.get_query_representation(query_tokens)
+
+        # Compute embedding means for retrieval boost
+        query_embed = self.shared_token_embed(query_tokens)
+        query_embed_mean = mx.mean(query_embed, axis=1)
+
+        chunk_embed = self.shared_token_embed(chunk_tokens)
+        chunk_embed_means = mx.mean(chunk_embed, axis=1)
+
+        # Retrieve relevant chunks
+        retrieved_hidden, retrieval_scores, chunk_indices, _ = (
+            self.index_search.search(
+                query_repr, index,
+                query_embed_mean=query_embed_mean,
+                chunk_embed_means=chunk_embed_means
+            )
+        )
+
+        # Get chunk token IDs for copy mechanism
+        retrieved_chunk_tokens = self._gather_chunk_tokens(chunk_tokens, chunk_indices)
+
+        # Generate autoregressively
+        generated = self.decoder.generate(
+            query_tokens, retrieved_hidden, retrieved_chunk_tokens, max_length
+        )
+
+        return generated, retrieval_scores, chunk_indices
 
     def count_parameters(self) -> int:
         """Count total number of trainable parameters.
