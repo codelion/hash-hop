@@ -1,0 +1,64 @@
+# IMT Learned Generation: Focus on learning generation after retrieval is working
+#
+# Key insight: Generation needs to learn cross-attention patterns to:
+# 1. Find where query appears in retrieved chunks
+# 2. Extract the value at correct offset
+#
+# Strategy:
+# - Small number of chunks (good retrieval)
+# - Larger decoder for better cross-attention
+# - More training steps
+# - Higher learning rate initially
+
+model:
+  # Moderate encoder
+  d_model: 128
+  encoder_layers: 2
+  encoder_heads: 4
+  encoder_ff_dim: 512
+  chunk_size: 256  # Smaller chunks
+
+  # Index
+  index_dim: 64
+  num_index_heads: 4
+  keys_per_chunk: 4
+  temperature: 1.0
+
+  # Larger decoder for better cross-attention learning
+  decoder_layers: 4
+  decoder_heads: 4
+  decoder_ff_dim: 512
+  retrieval_top_k: 1  # Just 1 chunk for focused generation learning
+
+  # Other
+  vocab_size: 101
+  dropout: 0.0  # No dropout during learning
+  max_hash_length: 12
+  use_gradient_checkpointing: false
+  chunk_batch_size: 16
+  memory_limit_fraction: 0.5
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_steps: 20000  # More training
+  gradient_accumulation: 1
+  eval_every: 500
+  eval_samples: 50
+  save_every: 2000
+  log_every: 50
+
+  # Small context for high retrieval accuracy
+  n_chars_problem: 600  # ~2 chunks
+  num_queries: 1
+  hops: 1
+  hash_pair_str_length: 6  # Short hashes
+
+  # Loss weights - focus on generation
+  lambda_retrieval: 5.0  # Keep retrieval learning
+  lambda_regularization: 0.0
+  lambda_contrastive: 2.0  # Strong embedding alignment
+
+  output_dir: checkpoints
+  experiment_name: learned_gen

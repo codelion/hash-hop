@@ -191,30 +191,20 @@ class LocalDecoder(nn.Module):
         self,
         hidden: mx.array,
         context: mx.array,
-        context_token_ids: mx.array = None,
-        query_token_ids: mx.array = None,
-        output_position: int = None,
     ) -> mx.array:
-        """Compute copy attention over context.
+        """Compute copy attention over context using pure learned attention.
 
-        The copy mechanism needs to attend to VALUE positions in context where
-        format is KEY>VALUE. We help the model by:
-        1. Computing learned attention over context positions
-        2. Adding bias towards positions immediately after where KEY appears
+        This is a standard pointer network attention mechanism with no
+        task-specific heuristics. The model must learn to attend to the
+        correct positions entirely from data.
 
         Args:
             hidden: Decoder hidden states (batch, seq_len, d_model).
             context: Context hidden states (batch, context_len, d_model).
-            context_token_ids: Token IDs of context (batch, context_len).
-            query_token_ids: Token IDs of query (batch, query_len).
-            output_position: Current output position index for single-step generation.
 
         Returns:
             Copy attention weights (batch, seq_len, context_len).
         """
-        batch_size, seq_len, _ = hidden.shape
-        context_len = context.shape[1]
-
         # Project to query and key spaces
         query = self.copy_query_proj(hidden)  # (batch, seq_len, d_model)
         key = self.copy_key_proj(context)  # (batch, context_len, d_model)
@@ -222,101 +212,6 @@ class LocalDecoder(nn.Module):
         # Compute attention scores with scaled dot-product
         d_k = self.d_model ** 0.5
         scores = mx.matmul(query, key.transpose(0, 2, 1)) / d_k  # (batch, seq_len, context_len)
-
-        # Add positional bias based on query token locations
-        # The VALUE we want to copy comes AFTER the KEY in context
-        if context_token_ids is not None and query_token_ids is not None:
-            query_len = query_token_ids.shape[1]
-
-            # For each context position, check if it matches any query token
-            # query_token_ids: (batch, query_len)
-            # context_token_ids: (batch, context_len)
-            query_expanded = query_token_ids[:, :, None]  # (batch, query_len, 1)
-            context_expanded = context_token_ids[:, None, :]  # (batch, 1, context_len)
-
-            # Match matrix: (batch, query_len, context_len)
-            matches = (query_expanded == context_expanded).astype(mx.float32)
-
-            # Find where query sequence starts in context
-            # If context[i:i+query_len] matches query, that's where KEY is
-            # VALUE starts at position i + query_len + 1 (after the '>' separator)
-
-            # Simplified: for each output position j, boost attention to positions
-            # that are offset from query token matches by (query_len + 1 + j)
-            # This means output position 0 attends to first char of VALUE,
-            # output position 1 attends to second char, etc.
-
-            # Find where the FULL query sequence matches in context
-            # This is more reliable than just matching the first token
-            # matches shape: (batch, query_len, context_len)
-
-            # For position p in context, compute how many consecutive tokens match
-            # A full match at position p means matches[:, 0, p] AND matches[:, 1, p+1] AND ...
-
-            # We'll compute a "sequence match score" at each context position
-            # sequence_match[p] = product of matches at positions p, p+1, ..., p+query_len-1
-            # But products are hard with gradients, so use sum instead
-
-            # Sum of matches across query positions, shifted appropriately
-            # If context[p:p+query_len] matches query, then sequence_match[p] = query_len
-            query_len_actual = min(query_len, 4)  # Only check first 4 chars (key length)
-
-            sequence_match = mx.zeros((batch_size, context_len))
-            for q_pos in range(query_len_actual):
-                # Shift matches[:, q_pos, :] left by q_pos positions
-                if q_pos < context_len:
-                    shifted_match = mx.concatenate([
-                        matches[:, q_pos, q_pos:],
-                        mx.zeros((batch_size, q_pos))
-                    ], axis=1)
-                    sequence_match = sequence_match + shifted_match
-
-            # Normalize to [0, 1] range
-            sequence_match = sequence_match / query_len_actual
-
-            # Positions with high sequence_match (~1) are where the query starts
-            # The VALUE starts at (query_start + query_len + 1)
-            # query_len here is the actual KEY length (4 chars typically)
-            value_offset = query_len_actual + 1  # +1 for '>' separator
-
-            # Build position bias list for each output position
-            # If output_position is provided (single-step generation), only compute
-            # bias for that specific position
-            if output_position is not None:
-                # During generation: only one position, use explicit output_position
-                total_offset = value_offset + output_position
-
-                if total_offset < context_len and output_position < self.config.max_hash_length:
-                    zeros_before = mx.zeros((batch_size, total_offset))
-                    match_truncated = sequence_match[:, :context_len - total_offset]
-                    position_bias = mx.concatenate([zeros_before, match_truncated], axis=1)
-                else:
-                    position_bias = mx.zeros((batch_size, context_len))
-
-                # Expand to (batch, 1, context_len) for single-position
-                position_bias = position_bias[:, None, :]
-            else:
-                # During training: compute for all output positions
-                bias_list = []
-                for out_pos in range(seq_len):
-                    # Total offset: where value starts + output position
-                    total_offset = value_offset + out_pos
-
-                    if total_offset < context_len and out_pos < self.config.max_hash_length:
-                        # Shift sequence_match by total_offset positions
-                        zeros_before = mx.zeros((batch_size, total_offset))
-                        match_truncated = sequence_match[:, :context_len - total_offset]
-                        shifted = mx.concatenate([zeros_before, match_truncated], axis=1)
-                    else:
-                        shifted = mx.zeros((batch_size, context_len))
-
-                    bias_list.append(shifted)
-
-                # Stack to create (batch, seq_len, context_len)
-                position_bias = mx.stack(bias_list, axis=1)
-
-            # Add position bias to scores - use strong bias
-            scores = scores + 5.0 * position_bias
 
         # Softmax over context positions
         return mx.softmax(scores, axis=-1)
@@ -436,13 +331,8 @@ class LocalDecoder(nn.Module):
         # Vocabulary logits
         vocab_logits = self.output_proj(target_hidden)  # (batch, target_len, vocab_size)
 
-        # Copy mechanism with token-based alignment
-        # Pass query_tokens to help align attention to positions after the query
-        copy_attention = self._compute_copy_attention(
-            target_hidden, context,
-            context_token_ids=context_tokens,
-            query_token_ids=query_tokens,
-        )
+        # Copy mechanism - pure learned attention with no task-specific heuristics
+        copy_attention = self._compute_copy_attention(target_hidden, context)
         copy_logits = self._scatter_copy_logits(copy_attention, context_tokens)
 
         # Copy gate: probability of copying vs generating from vocabulary
@@ -508,15 +398,8 @@ class LocalDecoder(nn.Module):
             # Vocab logits
             vocab_logits = self.output_proj(last_hidden)
 
-            # Copy mechanism for last position
-            # Pass token IDs for position bias AND the current output position
-            # step=0 means we're generating output position 0, etc.
-            copy_attention = self._compute_copy_attention(
-                last_hidden, context,
-                context_token_ids=context_tokens,
-                query_token_ids=query_tokens,
-                output_position=step,  # Critical: tells position bias which char to target
-            )
+            # Copy mechanism - pure learned attention
+            copy_attention = self._compute_copy_attention(last_hidden, context)
             copy_logits = self._scatter_copy_logits(copy_attention, context_tokens)
             copy_gate = mx.sigmoid(self.copy_gate_proj(last_hidden))
 

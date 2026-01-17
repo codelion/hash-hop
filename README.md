@@ -131,43 +131,59 @@ These results demonstrate that while models may theoretically handle longer cont
 
 ### IMT Results
 
-**Architecture:** Indexed Memory Transformer with autoregressive decoder and copy mechanism.
+**Architecture:** Indexed Memory Transformer with autoregressive decoder and copy mechanism (pointer network).
 
-| Context Length | Accuracy | Retrieval Recall | Parameters |
-|----------------|----------|------------------|------------|
-| 100 tokens | 90% | 100% | 261K |
-| 1K tokens | 87% | 96% | 261K |
-| 10K tokens | 76% | 88% | 261K |
+The IMT uses a fully generic architecture with no task-specific heuristics:
+- Standard transformer encoder for chunk encoding
+- Learned dense retrieval (query embedding similarity)
+- Standard pointer network for copy mechanism
+- No hardcoded knowledge of the KEY>VALUE format
 
-**Key Observations:**
-- The IMT architecture successfully learns to retrieve relevant chunks and copy exact token sequences
-- At small contexts (100 tokens), the model achieves 90% accuracy with perfect retrieval
-- At 1K tokens, the model achieves 87% accuracy (vs Gemini's 100%)
-- At 10K tokens, the model achieves 76% accuracy (vs Gemini's 96%), showing the architecture can scale
+**Current Status:**
 
-**Technical Improvements Made:**
-- **Max-scatter for copy logits:** Changed from summing attention weights across all positions with the same token to taking the max. This prevents common characters from being artificially boosted when they appear multiple times.
-- **Log-space copy logits:** Convert copy attention to log space so it has similar scale to vocabulary logits, enabling proper blending.
-- **Position-aware copy attention:** Added learned position bias to help the model focus on the VALUE positions after finding the KEY.
+| Context Length | Accuracy | Retrieval Recall | Parameters | Training Steps |
+|----------------|----------|------------------|------------|----------------|
+| 1K tokens | 0% | 99% | 916K | 50K |
+| 10K tokens | 0% | 83% | 916K | 100K |
+
+**Key Finding:**
+The retrieval component works well (83-99% recall), but the copy mechanism fails to learn which positions to attend to without task-specific guidance.
+
+**The Challenge:**
+For HashHop, the model must learn that for query "ABCD", it should:
+1. Find where "ABCD" appears in the context
+2. Skip the ">" separator
+3. Copy the next 4 characters
+
+With pure learned attention over 512-2048 context positions, this pattern is extremely hard to learn from scratch. The copy attention becomes nearly uniform, unable to focus on the correct positions.
+
+**Technical Details:**
+- **Max-scatter for copy logits:** Using max instead of sum prevents common tokens from being artificially boosted
+- **Log-space copy logits:** Converts attention weights to log space for proper blending with vocab logits
+- **Pure learned copy attention:** No position bias or task-specific heuristics
 
 **Comparison with Gemini:**
 
-| Context | Gemini 1.5 Flash | IMT (261K params) |
+| Context | Gemini 1.5 Flash | IMT (916K params) |
 |---------|------------------|-------------------|
-| 1K | 100% | 87% |
-| 10K | 96% | 76% |
-| 100K | 77% | TBD |
-| 1M | 4% | TBD |
+| 1K | 100% | 0% |
+| 10K | 96% | 0% |
+| 100K | 77% | - |
+| 1M | 4% | - |
 
-**Current Limitations:**
-1. At larger contexts, the copy attention becomes less precise due to more potential false matches
-2. The retrieval recall (~88%) limits overall accuracy at 10K tokens
-3. Gap with Gemini narrows as context grows (13% gap at 1K vs 20% gap at 10K)
+**Analysis:**
+This result demonstrates that the HashHop task requires either:
+1. **Much larger models** with more capacity to learn the copy pattern
+2. **Much longer training** (millions of steps instead of 100K)
+3. **Architectural innovations** like relative positional encoding in the copy mechanism
+4. **Pre-training** on related tasks before fine-tuning on HashHop
+
+The retrieval component is effective, but the "last mile" of copying the correct tokens from context remains an open challenge for small models without task-specific inductive biases.
 
 **Training Details:**
 - Hardware: Apple Silicon (M1/M2/M3 with unified memory)
 - Framework: MLX
-- Training time: ~5-10 minutes per 10K steps (1K context), ~30 minutes per 10K steps (10K context)
+- Training time: ~30 minutes per 10K steps
 - Memory usage: <2GB for training, scales with context size
 
 ## Acknowledgments

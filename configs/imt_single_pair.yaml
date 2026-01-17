@@ -1,0 +1,53 @@
+# IMT Single Pair: Simplest possible generation task
+#
+# Key insight: Make chunk contain only ONE hash pair
+# This removes the need to search for the query in context
+# The model just needs to learn to output the value after >
+
+model:
+  d_model: 128
+  encoder_layers: 2
+  encoder_heads: 4
+  encoder_ff_dim: 512
+  chunk_size: 32  # Very small chunks - just enough for one pair
+
+  index_dim: 64
+  num_index_heads: 4
+  keys_per_chunk: 1  # Just one key since one pair
+  temperature: 1.0
+
+  decoder_layers: 4
+  decoder_heads: 4
+  decoder_ff_dim: 512
+  retrieval_top_k: 1
+
+  vocab_size: 101
+  dropout: 0.0
+  max_hash_length: 10
+  use_gradient_checkpointing: false
+  chunk_batch_size: 16
+  memory_limit_fraction: 0.5
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_steps: 20000
+  gradient_accumulation: 1
+  eval_every: 500
+  eval_samples: 50
+  save_every: 2000
+  log_every: 50
+
+  # VERY small - just ~60 chars = ~2 chunks with one pair each
+  n_chars_problem: 60
+  num_queries: 1
+  hops: 1
+  hash_pair_str_length: 4  # Short 4-char hashes
+
+  lambda_retrieval: 5.0
+  lambda_regularization: 0.0
+  lambda_contrastive: 2.0
+
+  output_dir: checkpoints
+  experiment_name: single_pair

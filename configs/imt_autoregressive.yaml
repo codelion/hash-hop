@@ -1,0 +1,65 @@
+# IMT Autoregressive: Train generation with copy mechanism
+#
+# Key changes from previous approach:
+# - Autoregressive generation (predict one token at a time)
+# - Copy mechanism (pointer network) for exact token copying
+# - Teacher forcing during training
+# - BOS/EOS tokens for sequence boundaries
+#
+# This should fix the generation failure (0% exact match with "KKKK" outputs)
+
+model:
+  # Moderate model size - bigger decoder for better generation
+  d_model: 256
+  encoder_layers: 2
+  encoder_heads: 4
+  encoder_ff_dim: 1024
+  chunk_size: 256  # Smaller chunks for manageable context
+
+  # Index configuration
+  index_dim: 128
+  num_index_heads: 4
+  keys_per_chunk: 4
+  temperature: 1.0
+
+  # Larger decoder for autoregressive generation
+  decoder_layers: 4
+  decoder_heads: 4
+  decoder_ff_dim: 1024
+  retrieval_top_k: 2  # Retrieve 2 chunks for generation
+
+  # Vocabulary (full ASCII)
+  vocab_size: 101
+  dropout: 0.0
+  max_hash_length: 16
+
+  # Memory optimization
+  use_gradient_checkpointing: false
+  chunk_batch_size: 16
+  memory_limit_fraction: 0.5
+
+training:
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  warmup_steps: 500
+  max_steps: 30000
+  gradient_accumulation: 1
+  eval_every: 500
+  eval_samples: 30
+  save_every: 2000
+  log_every: 50
+
+  # Start with small context for learning
+  n_chars_problem: 2000  # ~8 chunks
+  num_queries: 1
+  hops: 1
+  hash_pair_str_length: 8  # 8-char hashes
+
+  # Loss weights
+  lambda_retrieval: 2.0  # Strong retrieval signal
+  lambda_regularization: 0.0
+  lambda_contrastive: 1.0
+  lambda_copy: 0.1  # Encourage copy mechanism
+
+  output_dir: checkpoints
+  experiment_name: autoregressive
