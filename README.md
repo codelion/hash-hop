@@ -186,6 +186,39 @@ The retrieval component is effective, but the "last mile" of copying the correct
 - Training time: ~30 minutes per 10K steps
 - Memory usage: <2GB for training, scales with context size
 
+### T5-base Fine-tuning Results
+
+We also tested fine-tuning Google's T5-base (220M parameters) on HashHop to see if a pretrained encoder-decoder model could solve the task.
+
+| Context Length | Accuracy | Parameters | Training Steps |
+|----------------|----------|------------|----------------|
+| 200 chars | **98%** | 220M | 2K |
+| 1K chars | 0-2% | 220M | 20K |
+
+**Key Findings:**
+- T5-base achieves **98% accuracy** on very short contexts (200 chars, ~20 hash pairs)
+- On longer contexts (1K chars, ~100 hash pairs), T5-base struggles even after 20K training steps
+- The model learns the output format (4-character strings) but fails at the retrieval
+
+**Why T5 struggles on longer contexts:**
+1. **Tokenization mismatch:** T5 uses SentencePiece which fragments random character strings unpredictably
+2. **Attention scaling:** Full attention over ~500 tokens is harder than over ~100 tokens
+3. **Pattern complexity:** Finding one matching hash among 100+ pairs requires more capacity
+
+**Comparison:**
+
+| Context | Gemini 1.5 Flash | T5-base (220M) | IMT (916K) |
+|---------|------------------|----------------|------------|
+| 200 chars | 100% | 98% | - |
+| 1K chars | 100% | 0-2% | 0% |
+| 10K chars | 96% | - | 0% |
+
+**Conclusion:**
+Both pretrained (T5) and from-scratch (IMT) approaches struggle with HashHop at scale. The task requires either:
+- Very large pretrained models (like Gemini with billions of parameters)
+- Novel architectural innovations for efficient long-context retrieval
+- Extensive task-specific training (potentially millions of steps)
+
 ## Acknowledgments
 
 - Original HashHop benchmark: [Magic](https://github.com/magicproduct/hash-hop)
