@@ -212,15 +212,20 @@ We implemented curriculum learning to progressively train on harder examples:
 | Level | Context | Accuracy | Steps | Status |
 |-------|---------|----------|-------|--------|
 | 1 | 100 chars | **100%** | 1K | PASS |
-| 2 | 200 chars | **98%** | 1.5K | PASS |
-| 3 | 500 chars | TBD | 3K | In Progress |
+| 2 | 200 chars | **100%** | 1K | PASS |
+| 3 | 500 chars | **6%** | 3K | FAIL (threshold: 70%) |
+
+**Key Findings:**
+- Curriculum learning successfully teaches T5-base to master short contexts (100-200 chars)
+- The model achieves 100% accuracy on both Level 1 and Level 2
+- **No catastrophic forgetting**: Previous levels maintain 93-100% accuracy during Level 3 training
+- However, the model fails to generalize to 500 chars even with curriculum learning
+- Loss at Level 3 remains high (~0.7-1.4) compared to near-zero at Levels 1-2
 
 **Training Command:**
 ```bash
-python t5/train_curriculum.py --max-level 5 --eval-every 200
+poetry run python t5/train_curriculum.py --max-level 5 --eval-every 200
 ```
-
-Curriculum learning allows the model to first master easy examples before tackling harder ones. Early results show strong performance on the first two levels.
 
 ### ByT5 (Byte-level T5) Results
 
@@ -228,9 +233,9 @@ We also tested ByT5-small (300M parameters), a byte-level variant of T5 that pro
 
 | Context Length | Accuracy | Parameters | Training Steps |
 |----------------|----------|------------|----------------|
-| 200 chars | 0% | 300M | 500 |
+| 200 chars | **0%** | 300M | 5000 |
 
-**Status:** ByT5 did not achieve accuracy within 500 steps. The loss decreased from ~5.0 to ~1.0 but the model has not yet learned the task. Longer training may be needed.
+**Status:** ByT5-small failed to learn the task even after 5000 steps. Loss remained constant at ~5.75 (near random), indicating a potential architecture/weight loading issue. The byte-level tokenization should theoretically help, but the model is not training properly.
 
 **Training Command:**
 ```bash
@@ -238,23 +243,25 @@ We also tested ByT5-small (300M parameters), a byte-level variant of T5 that pro
 poetry install -E torch
 
 # Train ByT5-small
-python t5/train_byt5.py --context-size 200 --max-steps 5000 --batch-size 2
+poetry run python t5/train_byt5.py --context-size 200 --max-steps 5000 --batch-size 2
 ```
 
 **Comparison:**
 
-| Context | Gemini 1.5 Flash | T5-base (220M) | ByT5-small (300M) | IMT (916K) |
-|---------|------------------|----------------|-------------------|------------|
-| 200 chars | 100% | 98% | 0% (500 steps) | - |
-| 1K chars | 100% | 0-2% | - | 0% |
-| 10K chars | 96% | - | - | 0% |
+| Context | Gemini 1.5 Flash | T5-base (220M) | T5 + Curriculum | ByT5-small (300M) | IMT (916K) |
+|---------|------------------|----------------|-----------------|-------------------|------------|
+| 100 chars | 100% | - | **100%** | - | - |
+| 200 chars | 100% | 98% | **100%** | 0% | - |
+| 500 chars | 100% | - | **6%** | - | - |
+| 1K chars | 100% | 0-2% | - | - | 0% |
+| 10K chars | 96% | - | - | - | 0% |
 
 **Conclusion:**
-Both pretrained (T5, ByT5) and from-scratch (IMT) approaches struggle with HashHop at scale. The task requires either:
-- Very large pretrained models (like Gemini with billions of parameters)
-- Novel architectural innovations for efficient long-context retrieval
-- Extensive task-specific training (potentially millions of steps)
-- Curriculum learning to bootstrap from easier examples
+- **Curriculum learning helps** but doesn't fully solve the scaling problem
+- T5-base can achieve 100% on short contexts (100-200 chars) with curriculum learning
+- The jump from 200 to 500 chars proves difficult - accuracy drops from 100% to 6%
+- This suggests a fundamental limitation in T5-base's ability to handle longer retrieval tasks
+- Next steps: Try T5-large (770M params) or investigate architectural changes
 
 ## Acknowledgments
 
