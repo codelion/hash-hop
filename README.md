@@ -205,19 +205,56 @@ We also tested fine-tuning Google's T5-base (220M parameters) on HashHop to see 
 2. **Attention scaling:** Full attention over ~500 tokens is harder than over ~100 tokens
 3. **Pattern complexity:** Finding one matching hash among 100+ pairs requires more capacity
 
+### T5-base Curriculum Learning
+
+We implemented curriculum learning to progressively train on harder examples:
+
+| Level | Context | Accuracy | Steps | Status |
+|-------|---------|----------|-------|--------|
+| 1 | 100 chars | **100%** | 1K | PASS |
+| 2 | 200 chars | **98%** | 1.5K | PASS |
+| 3 | 500 chars | TBD | 3K | In Progress |
+
+**Training Command:**
+```bash
+python t5/train_curriculum.py --max-level 5 --eval-every 200
+```
+
+Curriculum learning allows the model to first master easy examples before tackling harder ones. Early results show strong performance on the first two levels.
+
+### ByT5 (Byte-level T5) Results
+
+We also tested ByT5-small (300M parameters), a byte-level variant of T5 that processes raw UTF-8 bytes instead of subword tokens. This eliminates tokenization issues with random character strings.
+
+| Context Length | Accuracy | Parameters | Training Steps |
+|----------------|----------|------------|----------------|
+| 200 chars | 0% | 300M | 500 |
+
+**Status:** ByT5 did not achieve accuracy within 500 steps. The loss decreased from ~5.0 to ~1.0 but the model has not yet learned the task. Longer training may be needed.
+
+**Training Command:**
+```bash
+# Install with torch for weight conversion
+poetry install -E torch
+
+# Train ByT5-small
+python t5/train_byt5.py --context-size 200 --max-steps 5000 --batch-size 2
+```
+
 **Comparison:**
 
-| Context | Gemini 1.5 Flash | T5-base (220M) | IMT (916K) |
-|---------|------------------|----------------|------------|
-| 200 chars | 100% | 98% | - |
-| 1K chars | 100% | 0-2% | 0% |
-| 10K chars | 96% | - | 0% |
+| Context | Gemini 1.5 Flash | T5-base (220M) | ByT5-small (300M) | IMT (916K) |
+|---------|------------------|----------------|-------------------|------------|
+| 200 chars | 100% | 98% | 0% (500 steps) | - |
+| 1K chars | 100% | 0-2% | - | 0% |
+| 10K chars | 96% | - | - | 0% |
 
 **Conclusion:**
-Both pretrained (T5) and from-scratch (IMT) approaches struggle with HashHop at scale. The task requires either:
+Both pretrained (T5, ByT5) and from-scratch (IMT) approaches struggle with HashHop at scale. The task requires either:
 - Very large pretrained models (like Gemini with billions of parameters)
 - Novel architectural innovations for efficient long-context retrieval
 - Extensive task-specific training (potentially millions of steps)
+- Curriculum learning to bootstrap from easier examples
 
 ## Acknowledgments
 

@@ -12,6 +12,10 @@ mlx = ">=0.18.0"
 pyyaml = ">=6.0"
 sentencepiece = "^0.2.1"
 transformers = "^4.57.6"
+torch = {version = "^2.0", optional = true}  # For ByT5 weight conversion
+
+[tool.poetry.extras]
+torch = ["torch"]
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.13.0"

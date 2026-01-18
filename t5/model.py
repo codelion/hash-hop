@@ -368,6 +368,9 @@ class T5(nn.Module):
                 "layers.0.layer.0.SelfAttention.relative_attention_bias.",
                 "relative_attention_bias.embeddings.",
             ),
+            # ByT5 uses separate embed_tokens instead of shared
+            ("encoder.embed_tokens.", "wte."),
+            ("decoder.embed_tokens.", "wte."),
         ]
 
         encoder_replacement_patterns = [
