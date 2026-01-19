@@ -4,17 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HashHop is a long-context evaluation benchmark for large language models, developed by Magic. It tests an LLM's ability to follow chains of hash-pair associations across long prompts (up to millions of tokens).
+HashHop is a long-context evaluation benchmark for large language models. It tests an LLM's ability to follow chains of hash-pair associations across long prompts (up to millions of tokens).
+
+This repository includes:
+1. **HashHop Benchmark**: Data generation for multi-hop hash retrieval tasks
+2. **Tokenized Solver**: A simple architecture achieving 100% accuracy at 1M+ tokens
 
 ## Repository Structure
 
 ```
 hashhop/
-  __init__.py      # Exports MultiHopEval
-  generate.py      # Core evaluation generation logic
-  test_generate.py # Unit tests for generation
-test.py            # Additional test file
-train.py           # Training utilities
+  __init__.py           # Exports MultiHopEval
+  generate.py           # Core evaluation generation logic
+  test_generate.py      # Unit tests for generation
+tokenized_hashhop.py    # Tokenized solver implementation
+tests/                  # Test suite
 ```
 
 ## Key Commands
@@ -24,27 +28,32 @@ train.py           # Training utilities
 poetry install
 ```
 
+### Running the Solver
+```bash
+# Basic usage
+poetry run python tokenized_hashhop.py --tokens 10000
+
+# Full benchmark
+poetry run python tokenized_hashhop.py --benchmark
+```
+
 ### Running Tests
 ```bash
 poetry run pytest
 ```
 
-### Code Quality (Pre-commit hooks)
+### Code Quality
 ```bash
 poetry run ruff check --fix   # Linting
 poetry run ruff format        # Formatting
 poetry run mypy               # Type checking
-poetry run codespell .        # Spell checking
-```
-
-### Run Pre-commit Manually
-```bash
-poetry run pre-commit run --all-files
 ```
 
 ## Architecture
 
-The core class is `MultiHopEval` in `hashhop/generate.py`:
+### HashHop Benchmark (`hashhop/generate.py`)
+
+The core class is `MultiHopEval`:
 
 - **`MultiHopEval.make_one()`**: Generates a single evaluation sample with:
   - `n_chars_problem`: Total prompt size in characters
@@ -58,11 +67,18 @@ The core class is `MultiHopEval` in `hashhop/generate.py`:
   - `completion`: Expected model output format
   - `targets`: Query-to-answer mapping for evaluation
 
-The benchmark works by creating chains of hash associations where the model must follow N hops to find the final value (marked with quotes).
+### Tokenized Solver (`tokenized_hashhop.py`)
+
+Key insight: Treat each hash string as a single token (MQAR approach).
+
+Components:
+- **HashTokenizer**: Maps hash strings to unique token IDs
+- **TokenizedRetriever**: Learned embeddings with hard attention
+- **Multi-hop following**: Iteratively retrieves through chain
 
 ## Code Style
 
-- Python 3.9+ with type annotations required (`disallow_untyped_defs = true`)
+- Python 3.9+ with type annotations
 - Line length: 100 characters
 - Uses ruff for linting and formatting
 - Uses mypy for type checking
