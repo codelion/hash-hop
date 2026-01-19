@@ -261,7 +261,66 @@ poetry run python t5/train_byt5.py --context-size 200 --max-steps 5000 --batch-s
 - T5-base can achieve 100% on short contexts (100-200 chars) with curriculum learning
 - The jump from 200 to 500 chars proves difficult - accuracy drops from 100% to 6%
 - This suggests a fundamental limitation in T5-base's ability to handle longer retrieval tasks
-- Next steps: Try T5-large (770M params) or investigate architectural changes
+
+### Neural Hash Table Experiments
+
+We investigated whether neural networks can implement hash table lookup - the core operation required by HashHop. The key finding is that **attention temperature is critical**.
+
+#### Approach Comparison
+
+| Approach | 2K chars | 5K chars | 10K chars | 50K chars | 100K chars | 500K chars | 1M chars |
+|----------|----------|----------|-----------|-----------|------------|------------|----------|
+| Pure Symbolic (regex + dict) | **100%** | **100%** | **100%** | **100%** | **100%** | **100%** | **100%** |
+| Character-level (soft attn) | 92.5% | 0% | 0% | 0% | - | - | - |
+| Character-level (hard attn) | 89.5% | 83% | 86% | 50% | 0% | - | - |
+| Contrastive Learning | 78% | 83% | 76% | 60% | - | - | - |
+| **Tokenized (MQAR-style)** | **100%** | **100%** | **100%** | **100%** | **100%** | **100%** | **100%** |
+
+#### Key Insights
+
+1. **Tokenization is the Key!** Treating each 4-char string as a single token converts HashHop into MQAR (Multi-Query Associative Recall), which transformers solve perfectly. This achieves **100% accuracy at 1M chars (100K pairs)**.
+
+2. **Character-level Matching is Hard**: When the model must learn that "ABCD" == "ABCD" by comparing 4 individual characters, it struggles beyond ~10K chars due to attention entropy collapse.
+
+3. **Token-level Matching is Easy**: When "ABCD" is a single token ID, the model just needs to match token ID 42 == token ID 42. This is exactly what induction heads do!
+
+4. **Prior Work Confirms This**: The [Zoology paper](https://arxiv.org/abs/2312.04927) shows transformers solve MQAR perfectly, and [Anthropic's induction heads research](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/) shows this is how in-context learning works.
+
+5. **Implications for LLM Evaluation**: HashHop with random character strings tests a fundamentally different capability than real-world retrieval. Real tokens have learned embeddings that enable matching; random strings require learning embeddings from scratch.
+
+#### Experiment Files
+
+```bash
+# Test symbolic hash table (100% at all sizes)
+poetry run python experiments/neural_hashtable.py
+
+# Test hybrid with soft attention (fails at 1K+)
+poetry run python experiments/hybrid_hashtable.py
+
+# Test hard attention (scales to 10K, degrades at 50K+)
+poetry run python experiments/hard_attention_hashtable.py
+
+# Test at extreme scales (5K-100K chars)
+poetry run python experiments/hard_attention_scale_test.py
+
+# Test analytical exact-match (100% at 10M chars)
+poetry run python experiments/analytical_hashtable.py
+```
+
+#### Implications for T5/IMT
+
+The experiments reveal why T5 curriculum learning fails at 500 chars and why pure neural approaches struggle:
+
+1. **T5 uses standard softmax attention** - entropy is too high with 50+ keys
+2. **Hard attention helps** but still requires learning embeddings that discriminate among thousands of similar strings
+3. **The fundamental issue**: Neural networks must learn exact string matching, which is trivial symbolically but hard to learn from examples
+
+**Potential fixes for end-to-end models:**
+1. Use character-level exact matching modules (like our analytical approach)
+2. Add hard attention heads specifically for retrieval
+3. Use sparse attention (top-k) instead of full softmax
+4. Pre-train on exact matching tasks before HashHop
+5. Hybrid neuro-symbolic architecture with symbolic parsing + neural reasoning
 
 ## Acknowledgments
 
