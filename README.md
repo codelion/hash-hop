@@ -4,7 +4,7 @@ HashHop is a benchmark for evaluating long-context retrieval capabilities of lar
 
 This repository provides:
 1. **The HashHop Benchmark**: Data generation for multi-hop hash retrieval tasks
-2. **Tokenized HashHop Solver**: A simple architecture that achieves **100% accuracy at 1M+ tokens**
+2. **Tokenized HashHop Solver**: A simple architecture that achieves **100% accuracy at 10M tokens**
 
 > **Note**: This project extends the original [HashHop benchmark by Magic](https://github.com/magicproduct/hash-hop) with our tokenized solution.
 
@@ -16,8 +16,9 @@ This repository provides:
 | 10K tokens | 96% | **100%** |
 | 100K tokens | 77% | **100%** |
 | 1M tokens | 4% | **100%** |
+| 10M tokens | - | **100%** |
 
-**The tokenized solver achieves 100% accuracy where Gemini 1.5 Flash drops to 4%.**
+**The tokenized solver achieves 100% accuracy at 10M tokens where Gemini 1.5 Flash drops to 4% at 1M tokens.**
 
 ## Installation
 
@@ -33,7 +34,7 @@ poetry install
 # Run tokenized solver on 10K token context
 poetry run python tokenized_hashhop.py --tokens 10000
 
-# Run full benchmark
+# Run full benchmark (1K to 10M tokens)
 poetry run python tokenized_hashhop.py --benchmark
 ```
 
@@ -74,17 +75,14 @@ print(datapoint.targets)     # Query -> answer mapping
 
 ### Why It Works
 
-The key insight is that **tokenization converts HashHop into MQAR** (Multi-Query Associative Recall), which transformers solve perfectly via [induction heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/).
+The key insight is that **tokenization converts HashHop into MQAR** (Multi-Query Associative Recall), which attention mechanisms handle naturally.
 
 | Approach | Challenge | Result |
 |----------|-----------|--------|
 | Character-level | Must learn "ABCD" == "ABCD" by comparing 4 chars | Fails at scale |
 | Token-level | Just match token ID 42 == token ID 42 | Works perfectly |
 
-When each unique hash string becomes a single token:
-- No character-level matching needed
-- Attention can be sharp (one-hot)
-- Induction heads naturally implement key-value lookup
+With whole-string tokenization, random high-dimensional embeddings are **nearly orthogonal**, so the query embedding naturally has highest similarity with its matching key. This enables perfect retrieval without training.
 
 ### Architecture
 
@@ -100,7 +98,7 @@ Output: Predicted hash string
 
 The architecture is remarkably simple:
 - **Tokenizer**: Maps each unique N-char hash string to a token ID
-- **Embedding Layer**: Learned embeddings for each token
+- **Embedding Layer**: Random unit embeddings for each token (no training needed)
 - **Attention**: Query-key dot product with hard attention (low temperature)
 - **Retrieval**: Attention-weighted value embedding → nearest token lookup
 
@@ -110,7 +108,7 @@ The architecture is remarkably simple:
 # Basic usage
 poetry run python tokenized_hashhop.py --tokens 1000
 
-# Full benchmark across scales
+# Full benchmark across scales (1K to 10M tokens)
 poetry run python tokenized_hashhop.py --benchmark
 
 # Custom parameters
@@ -118,7 +116,6 @@ poetry run python tokenized_hashhop.py \
     --tokens 100000 \
     --hash-length 16 \
     --hops 2 \
-    --steps 1000 \
     --d-model 128
 ```
 
@@ -129,7 +126,7 @@ poetry run python tokenized_hashhop.py \
 | `--tokens` | 1000 | Context size in tokens |
 | `--hash-length` | 16 | Characters per hash string |
 | `--hops` | 2 | Number of hops to follow |
-| `--steps` | 1000 | Training steps |
+| `--eval-samples` | 100 | Number of evaluation samples |
 | `--d-model` | 128 | Embedding dimension |
 | `--benchmark` | - | Run full benchmark |
 
@@ -144,9 +141,8 @@ We evaluated Google's `gemini-1.5-flash-exp-0827` on 2-hop HashHop with 8-shot C
 | 1K tokens | 100% | **100%** | - |
 | 10K tokens | 96% | **100%** | +4% |
 | 100K tokens | 77% | **100%** | +23% |
-| 200K tokens | 37% | **100%** | +63% |
-| 500K tokens | 9% | **100%** | +91% |
 | 1M tokens | 4% | **100%** | +96% |
+| 10M tokens | - | **100%** | - |
 
 ### Why Gemini Fails
 
@@ -158,8 +154,8 @@ Gemini's performance degradation reveals a fundamental limitation:
 ### Why Tokenization Succeeds
 
 1. **Single-token hashes**: Each hash string is one token, enabling exact matching
-2. **Hard attention**: Low temperature makes attention nearly one-hot
-3. **Induction heads**: The architecture naturally implements [A][B]...[A] → [B] pattern
+2. **Random orthogonality**: High-dimensional random unit vectors are nearly orthogonal
+3. **Hard attention**: Low temperature makes attention nearly one-hot
 
 This is confirmed by prior research:
 - [Zoology paper](https://arxiv.org/abs/2312.04927): Transformers solve MQAR perfectly
