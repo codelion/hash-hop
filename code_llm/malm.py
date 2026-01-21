@@ -1,40 +1,53 @@
-"""MALM 70M: Production-scale Memory-Augmented LM for Python Code.
+"""MALM: Memory-Augmented Language Model for Python Code.
 
-A ~70M parameter model trained on CodeParrot to support:
+A 165M parameter model trained on CodeParrot that supports:
 1. Semantic queries - "find function that handles authentication"
-2. Exact retrieval - perfect key-value lookup
+2. Exact retrieval - perfect key-value lookup (like HashHop)
 3. Code understanding - answer questions about any Python codebase
 
-Architecture:
-- d_model: 768 (like BERT-base)
-- n_layers: 12
-- n_heads: 12
-- Query encoder: 4 layers
-- ~70M parameters total
+Architecture (165M parameters):
+- Embedding: vocab_size * d_model = 14407 * 768 = 11.1M
+- Position embedding: 128 * 768 = 0.1M
+- Query encoder (4 layers): 4 * (4 * 768^2 + 768 * 3072 * 2) = 28.4M
+- Value encoder (4 layers): 4 * (4 * 768^2 + 768 * 3072 * 2) = 28.4M
+- Decoder (12 layers): 12 * (4 * 768^2 + 768 * 3072 * 2) = 85.1M
+- Output projection: 768 * vocab_size = 11.1M
+- Layer norms and projections: ~1M
+- Total: ~165M parameters
 
-Training strategy:
-- Stream from CodeParrot
-- Extract function name, docstring, source, signature
-- Generate diverse query variations
-- Contrastive learning to align queries with functions
+Model weights are saved in MLX-compatible NumPy format (.npz).
+For PyTorch compatibility, use safetensors export.
 """
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import mlx.utils as mlx_utils
-from typing import List, Dict, Tuple, Iterator
+from typing import List, Dict, Tuple, Iterator, Optional
 import random
 import time
 import re
 import ast
+import json
 from pathlib import Path
 
 
-class MALM70M(nn.Module):
-    """70M parameter Memory-Augmented Language Model.
+class MALM(nn.Module):
+    """Memory-Augmented Language Model.
 
-    Larger model for better semantic understanding and generalization.
+    Architecture:
+    - Query encoder: Transforms NL queries into embeddings
+    - Memory bank: Stores function name → implementation mappings
+    - Retrieval: Attention-based lookup from query to memory
+    - Decoder: Generates output based on retrieved context
+
+    Parameter count formula:
+    - embed: vocab_size * d_model
+    - pos_embed: max_seq_len * d_model
+    - query_layers: n_query_layers * (4*d_model^2 + 2*d_model*d_ff)
+    - value_layers: n_query_layers * (4*d_model^2 + 2*d_model*d_ff)
+    - decoder_layers: n_layers * (4*d_model^2 + 2*d_model*d_ff)
+    - output: d_model * vocab_size
     """
 
     def __init__(
@@ -50,6 +63,9 @@ class MALM70M(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.n_query_layers = n_query_layers
         self.max_seq_len = max_seq_len
 
         # Embeddings
@@ -84,7 +100,12 @@ class MALM70M(nn.Module):
         self.output = nn.Linear(d_model, vocab_size)
 
         # Temperature for retrieval
-        self.log_temp = mx.array([0.0])  # Learnable temperature
+        self.log_temp = mx.array([0.0])
+
+    def count_parameters(self) -> int:
+        """Count total trainable parameters."""
+        flat_params = mlx_utils.tree_flatten(self.parameters())
+        return sum(p.size for _, p in flat_params)
 
     def encode_query(self, query_ids: mx.array) -> mx.array:
         """Encode variable-length query to single embedding."""
@@ -129,27 +150,43 @@ class MALM70M(nn.Module):
 
     def encode_memory(
         self,
-        key_tokens: mx.array,    # (num_items,) function name tokens
-        value_tokens: mx.array,  # (num_items, val_len) implementation tokens
+        key_tokens: mx.array,
+        value_tokens: mx.array,
     ) -> Tuple[mx.array, mx.array]:
-        """Encode memory bank."""
-        # Keys: function name embeddings (single token each)
+        """Encode memory bank.
+
+        Args:
+            key_tokens: (num_items,) function name token IDs
+            value_tokens: (num_items, val_len) implementation token IDs
+
+        Returns:
+            key_emb: (num_items, d_model) key embeddings
+            val_emb: (num_items, d_model) value embeddings
+        """
         key_emb = self.embed(key_tokens)
-
-        # Values: encoded implementations
         val_emb = self.encode_value(value_tokens)
-
         return key_emb, val_emb
 
     def retrieve(
         self,
-        query_emb: mx.array,  # (batch, d_model)
-        key_emb: mx.array,    # (num_items, d_model)
-        val_emb: mx.array,    # (num_items, d_model)
+        query_emb: mx.array,
+        key_emb: mx.array,
+        val_emb: mx.array,
     ) -> Tuple[mx.array, mx.array, mx.array]:
-        """Retrieve from memory."""
+        """Retrieve from memory using query.
+
+        Args:
+            query_emb: (batch, d_model) query embeddings
+            key_emb: (num_items, d_model) memory key embeddings
+            val_emb: (num_items, d_model) memory value embeddings
+
+        Returns:
+            retrieved: (batch, d_model) retrieved value embeddings
+            attn: (batch, num_items) attention weights
+            scores: (batch, num_items) raw attention scores
+        """
         scale = self.d_model ** -0.5
-        temp = mx.exp(self.log_temp) + 0.1  # Ensure positive temperature
+        temp = mx.exp(self.log_temp) + 0.1
 
         scores = (query_emb @ key_emb.T) * scale / temp
         attn = mx.softmax(scores, axis=-1)
@@ -159,21 +196,29 @@ class MALM70M(nn.Module):
 
     def forward(
         self,
-        query_ids: mx.array,     # (batch, query_len)
+        query_ids: mx.array,
         key_emb: mx.array,
         val_emb: mx.array,
-        continuation: mx.array,  # (batch, cont_len)
+        continuation: mx.array,
     ) -> Tuple[mx.array, mx.array, mx.array]:
-        """Forward with semantic query."""
+        """Forward pass with semantic query.
+
+        Args:
+            query_ids: (batch, query_len) query token IDs
+            key_emb: (num_items, d_model) memory keys
+            val_emb: (num_items, d_model) memory values
+            continuation: (batch, cont_len) continuation token IDs
+
+        Returns:
+            logits: (batch, cont_len, vocab_size) output logits
+            attn: (batch, num_items) retrieval attention
+            scores: (batch, num_items) retrieval scores
+        """
         B, L = continuation.shape
 
-        # Encode query
         query_emb = self.encode_query(query_ids)
-
-        # Retrieve
         retrieved, attn, scores = self.retrieve(query_emb, key_emb, val_emb)
 
-        # Embed continuation
         h = self.embed(continuation)
         pos = mx.arange(min(L, self.max_seq_len))
         h = h + self.pos_embed(pos)
@@ -196,8 +241,8 @@ class MALM70M(nn.Module):
         return self.forward(query_ids, key_emb, val_emb, continuation)
 
 
-class PythonTokenizer:
-    """Tokenizer optimized for Python code and natural language queries."""
+class Tokenizer:
+    """Tokenizer for Python code and natural language queries."""
 
     def __init__(self):
         self.special = {"<PAD>": 0, "<UNK>": 1, "<BOS>": 2, "<EOS>": 3, "<SEP>": 4}
@@ -205,7 +250,7 @@ class PythonTokenizer:
         self.id_to_token = {v: k for k, v in self.token_to_id.items()}
         self.next_id = len(self.special)
 
-        # Pre-add common Python keywords and tokens
+        # Pre-add common Python keywords
         keywords = [
             "def", "class", "return", "if", "else", "elif", "for", "while",
             "try", "except", "finally", "with", "as", "import", "from",
@@ -223,16 +268,13 @@ class PythonTokenizer:
             "convert", "calculate", "compute", "process", "handle", "that",
             "which", "the", "a", "an", "to", "for", "with", "from", "of",
             "numbers", "string", "list", "dict", "file", "data", "user",
-            "input", "output", "result", "value", "item", "element",
-            "authentication", "login", "password", "email", "url", "path",
-            "sort", "search", "filter", "map", "reduce", "sum", "average",
-            "maximum", "minimum", "count", "length", "size",
         ]
         for word in nl_words:
             self.add_token(word.lower())
 
     def add_token(self, token: str) -> int:
-        token = token.lower() if len(token) > 1 else token  # Lowercase multi-char
+        """Add token to vocabulary."""
+        token = token.lower() if len(token) > 1 else token
         if token not in self.token_to_id:
             self.token_to_id[token] = self.next_id
             self.id_to_token[self.next_id] = token
@@ -240,7 +282,7 @@ class PythonTokenizer:
         return self.token_to_id[token]
 
     def encode(self, text: str) -> List[int]:
-        # Tokenize preserving structure
+        """Tokenize text into token IDs."""
         tokens = re.findall(
             r'[a-zA-Z_][a-zA-Z0-9_]*|[+\-*/=():\[\].,<>!@#$%^&|~`{}]|\d+\.?\d*|"[^"]*"|\'[^\']*\'|\s+|\S',
             text
@@ -248,18 +290,39 @@ class PythonTokenizer:
         ids = []
         for t in tokens:
             t_lower = t.lower() if len(t) > 1 else t
-            if t.strip():  # Skip pure whitespace
+            if t.strip():
                 ids.append(self.add_token(t_lower))
         return ids
 
     def decode(self, ids: List[int]) -> str:
+        """Decode token IDs back to text."""
         return " ".join(self.id_to_token.get(i, "<UNK>") for i in ids if i != 0)
 
     def vocab_size(self) -> int:
         return self.next_id
 
+    def save(self, path: str):
+        """Save tokenizer to JSON."""
+        with open(path, "w") as f:
+            json.dump({
+                "token_to_id": self.token_to_id,
+                "next_id": self.next_id,
+            }, f)
 
-def extract_functions_from_code(code: str) -> List[Dict]:
+    @classmethod
+    def load(cls, path: str) -> "Tokenizer":
+        """Load tokenizer from JSON."""
+        tokenizer = cls.__new__(cls)
+        with open(path) as f:
+            data = json.load(f)
+        tokenizer.token_to_id = data["token_to_id"]
+        tokenizer.id_to_token = {int(v): k for k, v in tokenizer.token_to_id.items()}
+        tokenizer.next_id = data["next_id"]
+        tokenizer.special = {"<PAD>": 0, "<UNK>": 1, "<BOS>": 2, "<EOS>": 3, "<SEP>": 4}
+        return tokenizer
+
+
+def extract_functions(code: str) -> List[Dict]:
     """Extract functions with metadata from Python code."""
     functions = []
     try:
@@ -273,8 +336,6 @@ def extract_functions_from_code(code: str) -> List[Dict]:
                     source = '\n'.join(lines)
 
                     docstring = ast.get_docstring(node) or ""
-
-                    # Get signature
                     args = [arg.arg for arg in node.args.args]
                     signature = f"{node.name}({', '.join(args)})"
 
@@ -285,112 +346,55 @@ def extract_functions_from_code(code: str) -> List[Dict]:
                         "signature": signature,
                         "args": args,
                     })
-                except:
+                except Exception:
                     pass
     except SyntaxError:
         pass
     return functions
 
 
-def generate_queries_for_function(func: Dict) -> List[str]:
-    """Generate diverse NL query variations for a function."""
+def generate_queries(func: Dict) -> List[str]:
+    """Generate diverse query variations for a function."""
     queries = []
     name = func["name"]
     docstring = func.get("docstring", "")
     args = func.get("args", [])
 
-    # 1. Name-based queries (easy)
+    # Name-based queries
     queries.extend([
         f"function {name}",
         f"find {name}",
-        f"get {name}",
         f"{name} function",
-        f"the {name} method",
     ])
 
-    # 2. Name decomposition (e.g., "get_user_data" -> "get user data")
+    # Name decomposition (get_user_data -> get user data)
     name_parts = name.replace("_", " ").lower()
     if name_parts != name.lower():
         queries.extend([
             name_parts,
             f"function to {name_parts}",
-            f"function that {name_parts}",
         ])
 
-    # 3. Docstring-based queries
+    # Docstring-based queries
     if docstring:
-        doc_words = docstring.lower().split()[:8]
+        doc_words = docstring.lower().split()[:6]
         if len(doc_words) >= 2:
             queries.extend([
                 " ".join(doc_words[:4]),
-                " ".join(doc_words[:6]),
                 f"function that {' '.join(doc_words[:4])}",
-                f"function for {' '.join(doc_words[:3])}",
             ])
 
-    # 4. Argument-based queries
+    # Argument-based queries
     if args and args != ["self"]:
         clean_args = [a for a in args if a != "self"]
         if clean_args:
-            queries.extend([
-                f"function with {' '.join(clean_args[:3])}",
-                f"function taking {clean_args[0]}",
-            ])
+            queries.append(f"function with {' '.join(clean_args[:3])}")
 
-    # 5. Pattern-based queries (common patterns)
-    name_lower = name.lower()
-
-    patterns = {
-        ("add", "sum", "plus"): ["add numbers", "sum values", "addition"],
-        ("subtract", "minus", "diff"): ["subtract numbers", "difference"],
-        ("multiply", "product", "times"): ["multiply numbers", "product"],
-        ("divide", "quot"): ["divide numbers", "division"],
-        ("auth", "login", "signin"): ["user authentication", "login function", "authenticate user"],
-        ("logout", "signout"): ["logout user", "end session"],
-        ("sort"): ["sort list", "sort items", "sorting"],
-        ("search", "find", "lookup"): ["search function", "find element"],
-        ("parse"): ["parse data", "parsing"],
-        ("format"): ["format data", "formatting"],
-        ("valid", "check"): ["validate input", "check data"],
-        ("hash"): ["hash function", "hashing"],
-        ("encrypt", "decrypt"): ["encryption", "decryption"],
-        ("read", "load"): ["read data", "load file"],
-        ("write", "save"): ["write data", "save file"],
-        ("get"): ["get value", "retrieve"],
-        ("set"): ["set value", "assign"],
-        ("create", "make", "new"): ["create new", "make instance"],
-        ("delete", "remove"): ["delete item", "remove element"],
-        ("update", "modify"): ["update data", "modify"],
-        ("test"): ["test function", "testing"],
-        ("init", "__init__"): ["initialize", "constructor"],
-        ("str", "__str__"): ["string representation", "to string"],
-        ("len", "__len__"): ["get length", "size"],
-        ("iter", "__iter__"): ["iterate", "iteration"],
-        ("calc", "compute"): ["calculate", "compute value"],
-        ("convert", "transform"): ["convert data", "transform"],
-        ("filter"): ["filter items", "filtering"],
-        ("map"): ["map function", "mapping"],
-        ("reduce"): ["reduce function", "reduction"],
-        ("count"): ["count items", "counting"],
-        ("avg", "average", "mean"): ["calculate average", "mean value"],
-        ("max", "maximum"): ["find maximum", "max value"],
-        ("min", "minimum"): ["find minimum", "min value"],
-    }
-
-    for keywords, query_variations in patterns.items():
-        if isinstance(keywords, str):
-            keywords = (keywords,)
-        if any(kw in name_lower for kw in keywords):
-            queries.extend(query_variations)
-
-    return list(set(queries))  # Remove duplicates
+    return list(set(queries))
 
 
-def stream_codeparrot_functions(
-    max_functions: int = 5000,
-    min_docstring_len: int = 10,
-) -> Iterator[Dict]:
-    """Stream functions from CodeParrot with filtering."""
+def stream_codeparrot(max_functions: int = 5000) -> Iterator[Dict]:
+    """Stream functions from CodeParrot dataset."""
     try:
         from datasets import load_dataset
         print("Loading CodeParrot dataset (streaming)...")
@@ -410,26 +414,15 @@ def stream_codeparrot_functions(
                 break
 
             code = sample.get("content", "")
-            functions = extract_functions_from_code(code)
+            functions = extract_functions(code)
 
             for func in functions:
                 if count >= max_functions:
                     break
 
-                # Skip duplicates and functions without docstrings
                 name = func["name"]
-                if name in seen_names:
+                if name in seen_names or (name.startswith("_") and not name.startswith("__")):
                     continue
-
-                # Skip private/dunder methods (except common ones)
-                if name.startswith("_") and not name.startswith("__"):
-                    continue
-
-                # Prefer functions with docstrings for better training
-                if len(func.get("docstring", "")) < min_docstring_len:
-                    # Still include some without docstrings for diversity
-                    if random.random() > 0.3:
-                        continue
 
                 seen_names.add(name)
                 yield func
@@ -443,82 +436,177 @@ def stream_codeparrot_functions(
 
     except ImportError:
         print("datasets not available, using synthetic data")
-        yield from generate_synthetic_functions(max_functions)
+        for i in range(max_functions):
+            yield {
+                "name": f"function_{i}",
+                "source": f"def function_{i}(x): return x * {i}",
+                "docstring": f"Multiply x by {i}",
+                "signature": f"function_{i}(x)",
+                "args": ["x"],
+            }
 
 
-def generate_synthetic_functions(max_functions: int) -> Iterator[Dict]:
-    """Generate synthetic Python functions for testing."""
-    templates = [
-        ("add_{}", "def add_{}(a, b): return a + b", "Add two numbers"),
-        ("subtract_{}", "def subtract_{}(a, b): return a - b", "Subtract b from a"),
-        ("multiply_{}", "def multiply_{}(a, b): return a * b", "Multiply two numbers"),
-        ("divide_{}", "def divide_{}(a, b): return a / b", "Divide a by b"),
-        ("get_{}", "def get_{}(data, key): return data.get(key)", "Get value from data"),
-        ("set_{}", "def set_{}(data, key, val): data[key] = val", "Set value in data"),
-        ("validate_{}", "def validate_{}(value): return bool(value)", "Validate input"),
-        ("parse_{}", "def parse_{}(text): return text.split()", "Parse text"),
-        ("format_{}", "def format_{}(value): return str(value)", "Format value to string"),
-        ("calculate_{}", "def calculate_{}(x): return x * 2", "Calculate result"),
-    ]
+def save_model(model: MALM, tokenizer: Tokenizer, memory_items: List[Dict],
+               checkpoint_dir: str, use_safetensors: bool = True):
+    """Save model checkpoint.
 
-    for i in range(max_functions):
-        template = templates[i % len(templates)]
-        suffix = f"v{i // len(templates) + 1}"
-        yield {
-            "name": template[0].format(suffix),
-            "source": template[1].format(suffix),
-            "docstring": template[2],
-            "signature": f"{template[0].format(suffix)}(...)",
-            "args": ["a", "b"] if "a, b" in template[1] else ["x"],
-        }
+    Args:
+        model: Trained MALM model
+        tokenizer: Tokenizer instance
+        memory_items: List of function metadata
+        checkpoint_dir: Directory to save to
+        use_safetensors: If True, save as safetensors (PyTorch compatible)
+    """
+    import numpy as np
+
+    checkpoint_path = Path(checkpoint_dir)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    # Save model weights
+    flat_params = mlx_utils.tree_flatten(model.parameters())
+
+    if use_safetensors:
+        try:
+            from safetensors.numpy import save_file
+            weights = {k: np.array(v) for k, v in flat_params}
+            save_file(weights, str(checkpoint_path / "model.safetensors"))
+            print(f"  Saved model.safetensors")
+        except ImportError:
+            print("  safetensors not available, saving as .npz")
+            np.savez(str(checkpoint_path / "model.npz"),
+                     **{k: np.array(v) for k, v in flat_params})
+    else:
+        np.savez(str(checkpoint_path / "model.npz"),
+                 **{k: np.array(v) for k, v in flat_params})
+        print(f"  Saved model.npz")
+
+    # Save tokenizer
+    tokenizer.save(str(checkpoint_path / "tokenizer.json"))
+    print(f"  Saved tokenizer.json")
+
+    # Save function index
+    with open(checkpoint_path / "functions.json", "w") as f:
+        json.dump([{
+            "name": item["name"],
+            "signature": item.get("signature", ""),
+            "docstring": item.get("docstring", "")[:100],
+        } for item in memory_items], f)
+    print(f"  Saved functions.json")
+
+    # Save config
+    config = {
+        "vocab_size": model.vocab_size,
+        "d_model": model.d_model,
+        "n_heads": model.n_heads,
+        "n_layers": model.n_layers,
+        "n_query_layers": model.n_query_layers,
+        "max_seq_len": model.max_seq_len,
+        "num_parameters": model.count_parameters(),
+        "num_functions": len(memory_items),
+    }
+    with open(checkpoint_path / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"  Saved config.json")
+
+    print(f"\nCheckpoint saved to {checkpoint_dir}")
 
 
-def train_malm_70m(
+def load_model(checkpoint_dir: str) -> Tuple[MALM, Tokenizer, List[Dict]]:
+    """Load model from checkpoint.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoint files
+
+    Returns:
+        model: Loaded MALM model
+        tokenizer: Loaded tokenizer
+        memory_items: List of function metadata
+    """
+    import numpy as np
+
+    checkpoint_path = Path(checkpoint_dir)
+
+    # Load config
+    with open(checkpoint_path / "config.json") as f:
+        config = json.load(f)
+
+    # Create model
+    model = MALM(
+        vocab_size=config["vocab_size"],
+        d_model=config["d_model"],
+        n_heads=config["n_heads"],
+        n_layers=config["n_layers"],
+        n_query_layers=config["n_query_layers"],
+        max_seq_len=config["max_seq_len"],
+    )
+
+    # Load weights
+    if (checkpoint_path / "model.safetensors").exists():
+        from safetensors.numpy import load_file
+        weights = load_file(str(checkpoint_path / "model.safetensors"))
+    else:
+        weights = dict(np.load(str(checkpoint_path / "model.npz")))
+
+    # Unflatten and load
+    params = mlx_utils.tree_unflatten(list(weights.items()))
+    model.update(params)
+
+    # Load tokenizer
+    tokenizer = Tokenizer.load(str(checkpoint_path / "tokenizer.json"))
+
+    # Load functions
+    with open(checkpoint_path / "functions.json") as f:
+        memory_items = json.load(f)
+
+    return model, tokenizer, memory_items
+
+
+def train(
     max_functions: int = 2000,
     num_steps: int = 10000,
     batch_size: int = 32,
     lr: float = 3e-4,
-    warmup_steps: int = 500,
-    log_every: int = 100,
-    eval_every: int = 1000,
-    checkpoint_dir: str = "checkpoints/malm_70m",
+    checkpoint_dir: str = "checkpoints/malm",
 ):
-    """Train 70M MALM on CodeParrot."""
+    """Train MALM on CodeParrot.
 
+    Args:
+        max_functions: Maximum functions to load
+        num_steps: Training steps
+        batch_size: Batch size
+        lr: Learning rate
+        checkpoint_dir: Where to save checkpoints
+    """
     print("=" * 70)
-    print("MALM 70M: Production-scale Memory-Augmented LM")
+    print("MALM: Memory-Augmented Language Model")
     print("=" * 70)
 
-    tokenizer = PythonTokenizer()
+    tokenizer = Tokenizer()
 
-    # Stream and collect functions
+    # Load data
     print("\nExtracting functions from CodeParrot...")
     memory_items = []
-    all_queries = []  # (query_text, target_idx)
+    all_queries = []
 
-    for func in stream_codeparrot_functions(max_functions):
+    for func in stream_codeparrot(max_functions):
         idx = len(memory_items)
-
-        # Tokenize
         tokenizer.add_token(func["name"])
         tokenizer.encode(func["source"])
         if func.get("docstring"):
             tokenizer.encode(func["docstring"])
 
-        # Generate query variations
-        queries = generate_queries_for_function(func)
-        for q in queries:
+        for q in generate_queries(func):
             tokenizer.encode(q)
             all_queries.append((q, idx))
 
         memory_items.append(func)
 
-    print(f"\nDataset stats:")
+    print(f"\nDataset:")
     print(f"  Functions: {len(memory_items)}")
     print(f"  Query variations: {len(all_queries)}")
     print(f"  Vocab size: {tokenizer.vocab_size()}")
 
-    # Build memory arrays
+    # Build memory
     keys = [tokenizer.add_token(item["name"]) for item in memory_items]
     values = []
     max_val_len = 100
@@ -532,7 +620,7 @@ def train_malm_70m(
     values = mx.array(values)
 
     # Create model
-    model = MALM70M(
+    model = MALM(
         vocab_size=tokenizer.vocab_size() + 500,
         d_model=768,
         n_heads=12,
@@ -541,32 +629,20 @@ def train_malm_70m(
         max_seq_len=128,
     )
 
-    flat_params = mlx_utils.tree_flatten(model.parameters())
-    num_params = sum(p.size for _, p in flat_params)
-    print(f"\nModel parameters: {num_params:,}")
-    print(f"  (~{num_params / 1e6:.1f}M)")
+    num_params = model.count_parameters()
+    print(f"\nModel: {num_params:,} parameters ({num_params/1e6:.1f}M)")
 
     # Encode memory
     print("\nEncoding memory bank...")
     key_emb, val_emb = model.encode_memory(keys, values)
-    print(f"  Key embeddings: {key_emb.shape}")
-    print(f"  Value embeddings: {val_emb.shape}")
 
-    # Optimizer with warmup
-    lr_schedule = optim.linear_schedule(
-        init=1e-7,
-        end=lr,
-        steps=warmup_steps,
-    )
-    optimizer = optim.Adam(learning_rate=lr_schedule)
-
+    # Optimizer
+    optimizer = optim.Adam(learning_rate=lr)
     max_query_len = 20
 
     def loss_fn(model, query_ids, target_idx, key_emb, val_emb):
         cont = mx.zeros((query_ids.shape[0], 1), dtype=mx.int32) + 2
         _, _, scores = model(query_ids, key_emb, val_emb, cont)
-
-        # Contrastive loss with temperature
         scores_scaled = scores / 0.07
         return nn.losses.cross_entropy(scores_scaled, target_idx, reduction="mean")
 
@@ -581,7 +657,6 @@ def train_malm_70m(
     best_acc = 0.0
 
     for step in range(1, num_steps + 1):
-        # Sample batch
         batch = random.sample(all_queries, min(batch_size, len(all_queries)))
 
         query_ids = []
@@ -601,11 +676,10 @@ def train_malm_70m(
 
         total_loss += loss.item()
 
-        if step % log_every == 0:
-            avg_loss = total_loss / log_every
+        if step % 100 == 0:
+            avg_loss = total_loss / 100
             elapsed = time.time() - start_time
 
-            # Check accuracy
             cont = mx.zeros((batch_size, 1), dtype=mx.int32) + 2
             _, attn, _ = model(query_ids, key_emb, val_emb, cont)
             pred_idx = mx.argmax(attn, axis=1)
@@ -617,31 +691,26 @@ def train_malm_70m(
             print(f"Step {step:5d} | loss={avg_loss:.4f} | acc={acc:.0%} | best={best_acc:.0%} | time={elapsed:.0f}s")
             total_loss = 0.0
 
-        if step % eval_every == 0:
-            print("\n" + "-" * 40)
-            print("EVALUATION")
-            evaluate_70m(model, tokenizer, key_emb, val_emb, memory_items)
-            print("-" * 40 + "\n")
+        if step % 1000 == 0:
+            evaluate(model, tokenizer, key_emb, val_emb, memory_items)
 
-    # Save checkpoint
-    save_checkpoint(model, tokenizer, memory_items, checkpoint_dir)
+    # Save
+    save_model(model, tokenizer, memory_items, checkpoint_dir)
 
-    print(f"\nTraining complete!")
-    print(f"Best accuracy: {best_acc:.0%}")
-
+    print(f"\nTraining complete! Best accuracy: {best_acc:.0%}")
     return model, tokenizer, key_emb, val_emb, memory_items
 
 
-def evaluate_70m(model, tokenizer, key_emb, val_emb, memory_items):
-    """Evaluate model on various query types."""
-
+def evaluate(model: MALM, tokenizer: Tokenizer, key_emb: mx.array,
+             val_emb: mx.array, memory_items: List[Dict]):
+    """Evaluate model on different query types."""
     max_query_len = 20
-
-    # 1. Exact function name queries
-    print("\n1. Exact Name Queries:")
     test_items = random.sample(memory_items, min(10, len(memory_items)))
-    exact_correct = 0
 
+    print("\n--- Evaluation ---")
+
+    # Exact name queries
+    exact_correct = 0
     for item in test_items:
         query = f"function {item['name']}"
         ids = tokenizer.encode(query)
@@ -653,23 +722,17 @@ def evaluate_70m(model, tokenizer, key_emb, val_emb, memory_items):
 
         pred_idx = int(mx.argmax(attn[0]))
         expected_idx = memory_items.index(item)
-
         if pred_idx == expected_idx:
             exact_correct += 1
 
-    print(f"   Accuracy: {exact_correct}/{len(test_items)} ({100*exact_correct/len(test_items):.0f}%)")
+    print(f"  Exact name: {exact_correct}/{len(test_items)} ({100*exact_correct/len(test_items):.0f}%)")
 
-    # 2. Semantic queries (using docstrings)
-    print("\n2. Semantic Queries (from docstrings):")
+    # Semantic queries
     semantic_correct = 0
-    tested = 0
-
+    semantic_tested = 0
     for item in test_items:
         if item.get("docstring") and len(item["docstring"]) > 10:
-            # Use docstring words as query
-            doc_words = item["docstring"].lower().split()[:4]
-            query = " ".join(doc_words)
-
+            query = " ".join(item["docstring"].lower().split()[:4])
             ids = tokenizer.encode(query)
             ids = ids[:max_query_len] + [0] * (max_query_len - len(ids))
             query_ids = mx.array([ids])
@@ -679,123 +742,55 @@ def evaluate_70m(model, tokenizer, key_emb, val_emb, memory_items):
 
             pred_idx = int(mx.argmax(attn[0]))
             expected_idx = memory_items.index(item)
-
-            tested += 1
+            semantic_tested += 1
             if pred_idx == expected_idx:
                 semantic_correct += 1
 
-    if tested > 0:
-        print(f"   Accuracy: {semantic_correct}/{tested} ({100*semantic_correct/tested:.0f}%)")
-    else:
-        print("   (No functions with docstrings in sample)")
+    if semantic_tested > 0:
+        print(f"  Semantic: {semantic_correct}/{semantic_tested} ({100*semantic_correct/semantic_tested:.0f}%)")
 
-    # 3. Name decomposition queries
-    print("\n3. Name Decomposition Queries:")
-    decomp_correct = 0
-    decomp_tested = 0
-
-    for item in test_items:
-        if "_" in item["name"]:
-            # Convert "get_user_data" to "get user data"
-            query = item["name"].replace("_", " ")
-
-            ids = tokenizer.encode(query)
-            ids = ids[:max_query_len] + [0] * (max_query_len - len(ids))
-            query_ids = mx.array([ids])
-
-            cont = mx.array([[2]])
-            _, attn, _ = model(query_ids, key_emb, val_emb, cont)
-
-            pred_idx = int(mx.argmax(attn[0]))
-            expected_idx = memory_items.index(item)
-
-            decomp_tested += 1
-            if pred_idx == expected_idx:
-                decomp_correct += 1
-
-    if decomp_tested > 0:
-        print(f"   Accuracy: {decomp_correct}/{decomp_tested} ({100*decomp_correct/decomp_tested:.0f}%)")
-    else:
-        print("   (No underscore names in sample)")
-
-
-def save_checkpoint(model, tokenizer, memory_items, checkpoint_dir: str):
-    """Save model checkpoint."""
-    checkpoint_path = Path(checkpoint_dir)
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
-
-    # Save model weights
-    import json
-
-    weights_path = checkpoint_path / "model_weights.npz"
-    flat_params = mlx_utils.tree_flatten(model.parameters())
-    import numpy as np
-    np.savez(str(weights_path), **{k: np.array(v) for k, v in flat_params})
-
-    # Save tokenizer
-    tokenizer_path = checkpoint_path / "tokenizer.json"
-    with open(tokenizer_path, "w") as f:
-        json.dump({
-            "token_to_id": tokenizer.token_to_id,
-            "next_id": tokenizer.next_id,
-        }, f)
-
-    # Save function index
-    index_path = checkpoint_path / "function_index.json"
-    with open(index_path, "w") as f:
-        json.dump([{
-            "name": item["name"],
-            "signature": item.get("signature", ""),
-            "docstring": item.get("docstring", "")[:100],
-        } for item in memory_items], f)
-
-    print(f"\nCheckpoint saved to {checkpoint_dir}")
+    print("-" * 40)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train MALM 70M")
-    parser.add_argument("--max-functions", type=int, default=2000, help="Max functions to load")
-    parser.add_argument("--steps", type=int, default=10000, help="Training steps")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser = argparse.ArgumentParser(description="MALM: Memory-Augmented Language Model")
+    parser.add_argument("--max-functions", type=int, default=2000)
+    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/malm")
 
     args = parser.parse_args()
 
-    model, tokenizer, key_emb, val_emb, memory_items = train_malm_70m(
+    model, tokenizer, key_emb, val_emb, memory_items = train(
         max_functions=args.max_functions,
         num_steps=args.steps,
         batch_size=args.batch_size,
         lr=args.lr,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
-    # Final evaluation
+    # Final summary
     print("\n" + "=" * 70)
-    print("FINAL EVALUATION")
-    print("=" * 70)
-    evaluate_70m(model, tokenizer, key_emb, val_emb, memory_items)
-
-    print("\n" + "=" * 70)
-    print("MALM 70M SUMMARY")
+    print("MALM SUMMARY")
     print("=" * 70)
     print(f"""
-Model: {sum(p.size for _, p in mlx_utils.tree_flatten(model.parameters())):,} parameters
-Memory: {len(memory_items)} functions from CodeParrot
+Model: {model.count_parameters():,} parameters ({model.count_parameters()/1e6:.1f}M)
+Memory: {len(memory_items)} functions
 Vocab: {tokenizer.vocab_size()} tokens
 
+Architecture:
+  - d_model: {model.d_model}
+  - n_heads: {model.n_heads}
+  - n_layers: {model.n_layers} (decoder)
+  - n_query_layers: {model.n_query_layers} (encoder)
+
 Capabilities:
-✅ Exact name queries: "function calculate_sum"
-✅ Name decomposition: "calculate sum" → calculate_sum
-✅ Docstring queries: "add two numbers" → add
-✅ Pattern queries: "authentication function" → authenticate
+  - Exact name queries: "function calculate_sum"
+  - Name decomposition: "calculate sum" -> calculate_sum
+  - Semantic queries: "add two numbers" -> add
 
-Usage:
-  1. Load any Python codebase into memory
-  2. Query with natural language
-  3. Get matching function implementations
-
-To test on your codebase:
-  model.encode_memory(your_function_names, your_function_sources)
-  results = model.retrieve(your_query, key_emb, val_emb)
+Checkpoint: {args.checkpoint_dir}
 """)

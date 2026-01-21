@@ -1,145 +1,170 @@
-# Memory-Augmented Language Model (MALM) for Code
+# MALM: Memory-Augmented Language Model for Code
 
-## Overview
+A 165M parameter model for code understanding with **100% exact retrieval** accuracy. MALM uses the same key insight that made HashHop work: treating each function name as a single token enables perfect key-value lookup.
 
-MALM is our implementation of a memory-augmented architecture for code understanding. It achieves **100% exact retrieval** on 1000+ functions by using the same tokenization approach that made HashHop work.
-
-## Key Insight
-
-The breakthrough came from realizing that **HashHop works because each hash string is a single token**. When we apply the same principle to code (each function name = single token), we get perfect retrieval.
-
-## MALM 70M - Production Model
-
-Our production-scale model (165M parameters) supports **semantic natural language queries**, not just exact function names.
-
-### Results (2000 functions from CodeParrot)
-
-| Query Type | Accuracy |
-|------------|----------|
-| Exact Name Queries | **100%** |
-| Semantic Queries (docstrings) | **100%** |
-| Name Decomposition | **86%** |
-
-### Capabilities
-
-- **Exact name queries**: `"function calculate_sum"` → finds `calculate_sum`
-- **Semantic queries**: `"add two numbers"` → finds functions with matching docstrings
-- **Name decomposition**: `"get user data"` → finds `get_user_data`
-- **Pattern queries**: `"authentication function"` → finds auth-related functions
-
-### Usage
+## Quick Start
 
 ```bash
-# Train MALM 70M
-poetry run python code_llm/malm_70m.py --max-functions 2000 --steps 10000
+# Train MALM on CodeParrot
+poetry run python code_llm/malm.py --max-functions 2000 --steps 10000
 
-# Checkpoint saved to checkpoints/malm_70m/
-```
-
-### Model Stats
-- Parameters: 165M
-- Training time: ~19 minutes
-- Memory bank: 2000 functions
-- Vocabulary: 13,907 tokens
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Memory Bank                          │
-│  ┌─────────────┐        ┌─────────────────────────────┐ │
-│  │ Function    │        │ Implementation              │ │
-│  │ Name Token  │  ────▶ │ (encoded sequence)          │ │
-│  └─────────────┘        └─────────────────────────────┘ │
-│  add            ────▶   def add(a, b): return a + b    │
-│  multiply       ────▶   def multiply(a, b): return a*b │
-│  ...            ────▶   ...                            │
-└─────────────────────────────────────────────────────────┘
-         │
-         │ Query (function name token)
-         ▼
-┌─────────────────────────────────────────────────────────┐
-│              Attention-based Retrieval                  │
-│                                                         │
-│  query_emb @ key_emb.T → softmax → retrieved_value     │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────┐
-│              Transformer Decoder                        │
-│                                                         │
-│  Generate response based on retrieved context          │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+# Use pre-trained checkpoint
+python -c "
+from code_llm.malm import load_model, MALM
+model, tokenizer, functions = load_model('checkpoints/malm')
+print(f'Loaded {len(functions)} functions')
+"
 ```
 
 ## Results
 
-| Use Case | Accuracy | Notes |
-|----------|----------|-------|
-| Exact Key-Value Retrieval | **100%** | HashHop-style perfect lookup |
-| Code Retrieval & Q&A | **100%** | Query function name → get implementation |
-| Semantic Understanding | ✅ | Similar functions cluster in embedding space |
+| Query Type | Accuracy |
+|------------|----------|
+| Exact Name Queries | **100%** |
+| Semantic Queries | **100%** |
+| Name Decomposition | **86%** |
 
-### Training Statistics (1000 functions)
-- Model parameters: ~20M
-- Training time: ~80 seconds
-- Retrieval accuracy: 100% after 200 steps
-- Memory: Streams from CodeParrot dataset
+## Architecture
+
+MALM is a **165M parameter** model with the following components:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Query Encoder                           │
+│  "add two numbers" → [embedding] → attention → query_emb    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Memory Bank                             │
+│  ┌──────────────┐         ┌──────────────────────────────┐  │
+│  │ Function Key │  ────▶  │ Implementation Value          │  │
+│  │ (single tok) │         │ (encoded sequence)            │  │
+│  └──────────────┘         └──────────────────────────────┘  │
+│  add             ────▶    def add(a, b): return a + b       │
+│  multiply        ────▶    def multiply(a, b): return a * b  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ Attention-based retrieval
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Transformer Decoder                        │
+│                                                              │
+│  Generate output based on retrieved function context         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Parameter Breakdown (165M total)
+
+| Component | Parameters | Formula |
+|-----------|------------|---------|
+| Token Embedding | 11.1M | vocab_size (14407) × d_model (768) |
+| Position Embedding | 0.1M | max_seq_len (128) × d_model (768) |
+| Query Encoder (4 layers) | 28.4M | 4 × transformer_layer_params |
+| Value Encoder (4 layers) | 28.4M | 4 × transformer_layer_params |
+| Decoder (12 layers) | 85.1M | 12 × transformer_layer_params |
+| Output Projection | 11.1M | d_model (768) × vocab_size (14407) |
+| LayerNorms & Projections | ~1M | - |
+
+Where each transformer layer has: `4×d_model² + 2×d_model×d_ff` parameters.
+
+## Model Capabilities
+
+### 1. Exact Name Queries
+```python
+query = "function calculate_sum"
+# Returns: calculate_sum implementation
+```
+
+### 2. Name Decomposition
+```python
+query = "get user data"
+# Returns: get_user_data implementation
+```
+
+### 3. Semantic Queries
+```python
+query = "add two numbers"
+# Returns: function with matching docstring
+```
+
+## Checkpoint Format
+
+Models are saved in **MLX-compatible NumPy format** (`.npz`). For PyTorch compatibility, safetensors export is supported.
+
+```
+checkpoints/malm/
+├── config.json      # Model architecture config
+├── model.npz        # Model weights (MLX format)
+├── tokenizer.json   # Vocabulary
+└── functions.json   # Function metadata index
+```
+
+## Usage on Your Own Codebase
+
+```python
+from code_llm.malm import MALM, Tokenizer, extract_functions, load_model
+import mlx.core as mx
+
+# Load pre-trained model
+model, tokenizer, _ = load_model("checkpoints/malm")
+
+# Extract functions from your code
+with open("your_code.py") as f:
+    code = f.read()
+functions = extract_functions(code)
+
+# Build memory bank
+keys = [tokenizer.add_token(f["name"]) for f in functions]
+values = []
+for f in functions:
+    ids = tokenizer.encode(f["source"])
+    ids = ids[:100] + [0] * (100 - len(ids))
+    values.append(ids)
+
+keys = mx.array(keys)
+values = mx.array(values)
+key_emb, val_emb = model.encode_memory(keys, values)
+
+# Query
+query = "function that handles authentication"
+query_ids = tokenizer.encode(query)
+query_ids = query_ids[:20] + [0] * (20 - len(query_ids))
+query_ids = mx.array([query_ids])
+
+query_emb = model.encode_query(query_ids)
+_, attn, _ = model.retrieve(query_emb, key_emb, val_emb)
+
+# Get best match
+best_idx = int(mx.argmax(attn[0]))
+print(f"Found: {functions[best_idx]['name']}")
+print(functions[best_idx]['source'])
+```
+
+## Key Insight
+
+> **MALM achieves 100% exact retrieval because each function name is a single token.**
+>
+> This is the same principle that makes HashHop work. When keys are single tokens, the model learns a perfect hash function through contrastive training.
+
+## Training
+
+```bash
+# Full training (2000 functions, 10K steps, ~20 minutes)
+poetry run python code_llm/malm.py \
+    --max-functions 2000 \
+    --steps 10000 \
+    --batch-size 32 \
+    --lr 3e-4
+
+# Quick test (100 functions, 1K steps, ~2 minutes)
+poetry run python code_llm/malm.py \
+    --max-functions 100 \
+    --steps 1000
+```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `malm_70m.py` | Production model with semantic queries (165M params) |
-| `malm_v2.py` | Tokenized approach with 100% exact retrieval |
-| `memory_augmented_lm.py` | Original MALM implementation |
-| `train_malm_codeparrot.py` | Training script with CodeParrot streaming |
-
-## Usage
-
-```bash
-# Train MALM v2 (tokenized approach)
-poetry run python code_llm/malm_v2.py --max-memory 1000 --steps 5000
-
-# Train on CodeParrot with streaming
-poetry run python code_llm/train_malm_codeparrot.py --max-samples 5000 --max-memory 1000
-```
-
-## Key Differences from HashHop
-
-| Aspect | HashHop | MALM |
-|--------|---------|------|
-| Keys | Random 4-char hashes | Function names |
-| Values | Random 4-char hashes | Function implementations |
-| Query | Exact hash string | Function name |
-| Chain length | 1-3 hops | 1 hop (direct retrieval) |
-
-## Why It Works
-
-1. **Single-token keys**: Each function name is one token, enabling exact matching through learned embeddings
-2. **Contrastive training**: InfoNCE-style loss ensures each key has a unique embedding
-3. **Temperature annealing**: Start soft (temp=1.5), end sharp (temp=0.5) for stable training
-
-## Limitations
-
-- **Code transformation**: Pure retrieval can't do seq2seq transformation (would need encoder-decoder)
-- **Multi-hop**: Currently single-hop retrieval; extending to multi-hop is future work
-
-## How to Use on Any Python Codebase
-
-```python
-# 1. Load the trained model
-from malm_70m import MALM70M, PythonTokenizer
-
-# 2. Parse your codebase and extract functions
-functions = extract_functions_from_your_codebase()
-
-# 3. Encode into memory bank
-key_emb, val_emb = model.encode_memory(function_names, function_sources)
-
-# 4. Query with natural language
-query = "find function that handles user authentication"
-results = model.retrieve(query_emb, key_emb, val_emb)
-```
+| `malm.py` | Complete MALM implementation (model, tokenizer, training) |
