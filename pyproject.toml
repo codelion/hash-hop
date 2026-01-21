@@ -14,6 +14,7 @@ sentencepiece = "^0.2.1"
 transformers = "^4.57.6"
 torch = {version = "^2.0", optional = true}  # For ByT5 weight conversion
 datasets = "^4.5.0"
+mlx-lm = ">=0.20,<0.30"
 
 [tool.poetry.extras]
 torch = ["torch"]

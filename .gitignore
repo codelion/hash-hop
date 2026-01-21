@@ -165,3 +165,7 @@ cython_debug/
 # Ignore Mac DS_Store files
 .DS_Store
 **/.DS_Store
+
+# Local data and checkpoints (large files)
+data/
+checkpoints/

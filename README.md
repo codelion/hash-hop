@@ -1,14 +1,30 @@
-# HashHop: Solving Long-Context Retrieval at Scale
+# HashHop: From Benchmark to Memory-Augmented LLM
 
-HashHop is a benchmark for evaluating long-context retrieval capabilities of large language models. It tests an LLM's ability to follow chains of hash-pair associations across long prompts (up to millions of tokens).
+HashHop is a benchmark for evaluating long-context retrieval in large language models, plus a practical demonstration that the same tokenization insight enables building effective memory-augmented models.
 
-This repository provides:
-1. **The HashHop Benchmark**: Data generation for multi-hop hash retrieval tasks
-2. **Tokenized HashHop Solver**: A simple architecture that achieves **100% accuracy at 10M tokens**
+## What's in This Repository
 
-> **Note**: This project extends the original [HashHop benchmark by Magic](https://github.com/magicproduct/hash-hop) with our tokenized solution.
+| Component | Description | Key Result |
+|-----------|-------------|------------|
+| **HashHop Benchmark** | Multi-hop hash retrieval task | Tests LLM long-context capabilities |
+| **Tokenized Solver** | Simple architecture for HashHop | **100% accuracy at 10M tokens** |
+| **[MALM](code_llm/)** | Memory-Augmented Language Model | Semantic code search with 165M params |
 
-## Key Result
+> **Key Insight**: Treating each hash string (or function name) as a single token enables perfect key-value retrieval through attention.
+
+## The HashHop Benchmark
+
+HashHop tests a model's ability to follow chains of hash assignments across long contexts:
+
+```
+# Example with 2 hops:
+ABCDEFGHIJKLMNOp = QRSTUVWXYZabcdef    # First hop
+QRSTUVWXYZabcdef = 'ghijklmnopqrstuv'  # Second hop (final value in quotes)
+
+# Query: ABCDEFGHIJKLMNOp -> Answer: ghijklmnopqrstuv
+```
+
+### Benchmark Results
 
 | Context Length | Gemini 1.5 Flash | Tokenized Solver |
 |----------------|------------------|------------------|
@@ -18,7 +34,23 @@ This repository provides:
 | 1M tokens | 4% | **100%** |
 | 10M tokens | - | **100%** |
 
-**The tokenized solver achieves 100% accuracy at 10M tokens where Gemini 1.5 Flash drops to 4% at 1M tokens.**
+The tokenized solver achieves 100% accuracy where frontier LLMs fail because it treats each hash string as a single token, converting the problem to Multi-Query Associative Recall (MQAR).
+
+## From HashHop to MALM
+
+The same tokenization principle that solves HashHop also enables practical memory-augmented models:
+
+```
+HashHop:  hash_string → hash_string → final_value
+MALM:     function_name → function_implementation
+```
+
+**[MALM (Memory-Augmented Language Model)](code_llm/)** applies this insight to code retrieval:
+- 165M parameter model for semantic code search
+- Pre-trained on CodeParrot dataset
+- Available on HuggingFace: [`codelion/malm-165m`](https://huggingface.co/codelion/malm-165m)
+
+See the [code_llm/](code_llm/) directory for full documentation and demos.
 
 ## Installation
 
@@ -30,6 +62,8 @@ poetry install
 
 ## Quick Start
 
+### HashHop Benchmark
+
 ```bash
 # Run tokenized solver on 10K token context
 poetry run python tokenized_hashhop.py --tokens 10000
@@ -38,24 +72,48 @@ poetry run python tokenized_hashhop.py --tokens 10000
 poetry run python tokenized_hashhop.py --benchmark
 ```
 
-## The HashHop Task
+### MALM Code Search
 
-HashHop tests a model's ability to retrieve information across long contexts by following chains of hash assignments:
-
-```
-# Example with 2 hops:
-ABCDEFGHIJKLMNOp = QRSTUVWXYZabcdef    # First hop
-QRSTUVWXYZabcdef = 'ghijklmnopqrstuv'  # Second hop (final value in quotes)
-
-# Query: ABCDEFGHIJKLMNOp -> Answer: ghijklmnopqrstuv
+```bash
+# Download pre-trained model and run inference
+pip install mlx huggingface_hub numpy
+huggingface-cli download codelion/malm-165m --local-dir ./malm-165m
+python malm-165m/inference.py --query "function that sorts a list"
 ```
 
-The task becomes harder as:
-- Context length increases (more hash pairs to search through)
-- Number of hops increases (longer chains to follow)
-- Hash strings are random (no semantic patterns)
+Or train your own:
 
-### Generating Evaluation Data
+```bash
+poetry run python code_llm/malm.py --max-functions 2000 --steps 10000
+```
+
+## The Tokenization Insight
+
+### Why It Works
+
+| Approach | Challenge | Result |
+|----------|-----------|--------|
+| Character-level | Must learn "ABCD" == "ABCD" by comparing 4 chars | Fails at scale |
+| Token-level | Just match token ID 42 == token ID 42 | Works perfectly |
+
+With whole-string tokenization:
+1. **Single-token keys**: Each hash/function name is one token
+2. **Random orthogonality**: High-dimensional random embeddings are nearly orthogonal
+3. **Hard attention**: Low temperature makes attention nearly one-hot
+
+### Architecture
+
+```
+Input: "ABCDEFGH = IJKLMNOP"
+         ↓
+    [Tokenize each string as single token]
+         ↓
+Query Token → Attention over Key Tokens → Retrieve Value Token
+         ↓
+Output: Matched value
+```
+
+## Generating Evaluation Data
 
 ```python
 from hashhop import MultiHopEval
@@ -71,127 +129,18 @@ print(datapoint.prompt)      # Shuffled hash pairs
 print(datapoint.targets)     # Query -> answer mapping
 ```
 
-## The Tokenized Solution
-
-### Why It Works
-
-The key insight is that **tokenization converts HashHop into MQAR** (Multi-Query Associative Recall), which attention mechanisms handle naturally.
-
-| Approach | Challenge | Result |
-|----------|-----------|--------|
-| Character-level | Must learn "ABCD" == "ABCD" by comparing 4 chars | Fails at scale |
-| Token-level | Just match token ID 42 == token ID 42 | Works perfectly |
-
-With whole-string tokenization, random high-dimensional embeddings are **nearly orthogonal**, so the query embedding naturally has highest similarity with its matching key. This enables perfect retrieval without training.
-
-### Architecture
-
-```
-Input: "ABCDEFGH = IJKLMNOP"
-         ↓
-    [Tokenize each hash string as single token]
-         ↓
-Query Token → Attention over Key Tokens → Retrieve Value Token
-         ↓
-Output: Predicted hash string
-```
-
-The architecture is remarkably simple:
-- **Tokenizer**: Maps each unique N-char hash string to a token ID
-- **Embedding Layer**: Random unit embeddings for each token (no training needed)
-- **Attention**: Query-key dot product with hard attention (low temperature)
-- **Retrieval**: Attention-weighted value embedding → nearest token lookup
-
-### Usage
-
-```bash
-# Basic usage
-poetry run python tokenized_hashhop.py --tokens 1000
-
-# Full benchmark across scales (1K to 10M tokens)
-poetry run python tokenized_hashhop.py --benchmark
-
-# Custom parameters
-poetry run python tokenized_hashhop.py \
-    --tokens 100000 \
-    --hash-length 16 \
-    --hops 2 \
-    --d-model 128
-```
-
-### Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--tokens` | 1000 | Context size in tokens |
-| `--hash-length` | 16 | Characters per hash string |
-| `--hops` | 2 | Number of hops to follow |
-| `--eval-samples` | 100 | Number of evaluation samples |
-| `--d-model` | 128 | Embedding dimension |
-| `--benchmark` | - | Run full benchmark |
-
-## Benchmark Results
-
-### Comparison with Gemini 1.5 Flash
-
-We evaluated Google's `gemini-1.5-flash-exp-0827` on 2-hop HashHop with 8-shot CoT prompting:
-
-| Context | Gemini 1.5 Flash | Tokenized Solver | Improvement |
-|---------|------------------|------------------|-------------|
-| 1K tokens | 100% | **100%** | - |
-| 10K tokens | 96% | **100%** | +4% |
-| 100K tokens | 77% | **100%** | +23% |
-| 1M tokens | 4% | **100%** | +96% |
-| 10M tokens | - | **100%** | - |
-
-### Why Gemini Fails
-
-Gemini's performance degradation reveals a fundamental limitation:
-1. **Attention entropy collapse**: Softmax attention spreads across all positions
-2. **No exact matching**: Subword tokenization fragments random hash strings
-3. **Lost in the middle**: Known issue where LLMs struggle with mid-context retrieval
-
-### Why Tokenization Succeeds
-
-1. **Single-token hashes**: Each hash string is one token, enabling exact matching
-2. **Random orthogonality**: High-dimensional random unit vectors are nearly orthogonal
-3. **Hard attention**: Low temperature makes attention nearly one-hot
-
-This is confirmed by prior research:
-- [Zoology paper](https://arxiv.org/abs/2312.04927): Transformers solve MQAR perfectly
-- [Induction heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/): How in-context learning works
-
-## Implications
-
-### For LLM Evaluation
-
-HashHop with random character strings tests a **fundamentally different capability** than real-world retrieval:
-- Real tokens have learned embeddings that enable matching
-- Random strings require learning embeddings from scratch
-- This explains why frontier LLMs struggle despite long context windows
-
-### For Architecture Design
-
-The solution suggests that long-context retrieval benefits from:
-1. **Token-level exact matching** (not character-level)
-2. **Hard attention** (sparse, not softmax)
-3. **Explicit key-value structure** (not implicit in context)
-
-### For Practical Applications
-
-When building retrieval-augmented systems:
-- Consider tokenization strategy for retrieval targets
-- Use structured key-value formats when possible
-- Don't rely solely on LLM context for precise lookups
-
 ## Repository Structure
 
 ```
 hashhop/
-  __init__.py        # Exports MultiHopEval
-  generate.py        # Benchmark data generation
-  test_generate.py   # Unit tests
-tokenized_hashhop.py # Tokenized solver implementation
+  __init__.py           # Exports MultiHopEval
+  generate.py           # Benchmark data generation
+  test_generate.py      # Unit tests
+tokenized_hashhop.py    # Tokenized solver implementation
+code_llm/
+  README.md             # MALM documentation
+  malm.py               # Memory-Augmented LM implementation
+  demos/                # MALM + Qwen demos
 ```
 
 ## Development

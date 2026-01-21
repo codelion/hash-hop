@@ -989,10 +989,10 @@ files = [
 name = "jinja2"
 version = "3.1.6"
 description = "A very fast and expressive template engine."
-optional = true
+optional = false
 python-versions = ">=3.7"
 groups = ["main"]
-markers = "(python_version <= \"3.11\" or python_version >= \"3.12\") and extra == \"torch\""
+markers = "python_version <= \"3.11\" or python_version >= \"3.12\""
 files = [
     {file = "jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"},
     {file = "jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d"},
@@ -1008,10 +1008,10 @@ i18n = ["Babel (>=2.7)"]
 name = "markupsafe"
 version = "3.0.3"
 description = "Safely add untrusted strings to HTML/XML markup."
-optional = true
+optional = false
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "(python_version <= \"3.11\" or python_version >= \"3.12\") and extra == \"torch\""
+markers = "python_version <= \"3.11\" or python_version >= \"3.12\""
 files = [
     {file = "markupsafe-3.0.3-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:2f981d352f04553a7171b8e44369f2af4055f888dfb147d55e42d29e29e74559"},
     {file = "markupsafe-3.0.3-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:e1c1493fb6e50ab01d20a22826e57520f1284df32f2d8601fdd90b6304601419"},
@@ -1142,6 +1142,35 @@ mlx-metal = {version = "0.29.3", markers = "platform_system == \"Darwin\""}
 cpu = ["mlx-cpu (==0.29.3)"]
 cuda = ["mlx-cuda (==0.29.3)"]
 dev = ["nanobind (==2.4.0)", "numpy", "pre-commit", "setuptools (>=80)", "torch", "typing_extensions"]
+
+[[package]]
+name = "mlx-lm"
+version = "0.29.1"
+description = "LLMs with MLX and the Hugging Face Hub"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+markers = "python_version <= \"3.11\" or python_version >= \"3.12\""
+files = [
+    {file = "mlx_lm-0.29.1-py3-none-any.whl", hash = "sha256:440941b3054c2a2216e97615de584cc90fa1ea874782e20699b9895721fad8dc"},
+    {file = "mlx_lm-0.29.1.tar.gz", hash = "sha256:b99180d8f33d33a077b814e550bfb2d8a59ae003d668fd1f4b3fff62a381d34b"},
+]
+
+[package.dependencies]
+jinja2 = "*"
+mlx = {version = ">=0.29.2", markers = "platform_system == \"Darwin\""}
+numpy = "*"
+protobuf = "*"
+pyyaml = "*"
+sentencepiece = "*"
+transformers = ">=4.39.3"
+
+[package.extras]
+cpu = ["mlx[cpu] (>=0.29.2)"]
+cuda = ["mlx[cuda] (>=0.29.2)"]
+evaluate = ["lm-eval", "tqdm"]
+test = ["datasets", "lm-eval"]
+train = ["datasets", "tqdm"]
 
 [[package]]
 name = "mlx-metal"
@@ -2048,6 +2077,27 @@ files = [
     {file = "propcache-0.4.1-cp39-cp39-win_arm64.whl", hash = "sha256:5fd37c406dd6dc85aa743e214cef35dc54bbdd1419baac4f6ae5e5b1a2976938"},
     {file = "propcache-0.4.1-py3-none-any.whl", hash = "sha256:af2a6052aeb6cf17d3e46ee169099044fd8224cbaf75c76a2ef596e8163e2237"},
     {file = "propcache-0.4.1.tar.gz", hash = "sha256:f48107a8c637e80362555f37ecf49abe20370e557cc4ab374f04ec4423c97c3d"},
+]
+
+[[package]]
+name = "protobuf"
+version = "6.33.4"
+description = ""
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+markers = "python_version <= \"3.11\" or python_version >= \"3.12\""
+files = [
+    {file = "protobuf-6.33.4-cp310-abi3-win32.whl", hash = "sha256:918966612c8232fc6c24c78e1cd89784307f5814ad7506c308ee3cf86662850d"},
+    {file = "protobuf-6.33.4-cp310-abi3-win_amd64.whl", hash = "sha256:8f11ffae31ec67fc2554c2ef891dcb561dae9a2a3ed941f9e134c2db06657dbc"},
+    {file = "protobuf-6.33.4-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:2fe67f6c014c84f655ee06f6f66213f9254b3a8b6bda6cda0ccd4232c73c06f0"},
+    {file = "protobuf-6.33.4-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:757c978f82e74d75cba88eddec479df9b99a42b31193313b75e492c06a51764e"},
+    {file = "protobuf-6.33.4-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:c7c64f259c618f0bef7bee042075e390debbf9682334be2b67408ec7c1c09ee6"},
+    {file = "protobuf-6.33.4-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:3df850c2f8db9934de4cf8f9152f8dc2558f49f298f37f90c517e8e5c84c30e9"},
+    {file = "protobuf-6.33.4-cp39-cp39-win32.whl", hash = "sha256:955478a89559fa4568f5a81dce77260eabc5c686f9e8366219ebd30debf06aa6"},
+    {file = "protobuf-6.33.4-cp39-cp39-win_amd64.whl", hash = "sha256:0f12ddbf96912690c3582f9dffb55530ef32015ad8e678cd494312bd78314c4f"},
+    {file = "protobuf-6.33.4-py3-none-any.whl", hash = "sha256:1fe3730068fcf2e595816a6c34fe66eeedd37d51d0400b72fabc848811fdc1bc"},
+    {file = "protobuf-6.33.4.tar.gz", hash = "sha256:dc2e61bca3b10470c1912d166fe0af67bfc20eb55971dcef8dfa48ce14f0ed91"},
 ]
 
 [[package]]
@@ -3291,4 +3341,4 @@ torch = ["torch"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.9"
-content-hash = "a94cac2ab30967b93697c30de7c95d25dd3e5157caec3e6e0b71897732be9797"
+content-hash = "a53ff4030c4209dc91d40c566bb01a49d118808773a573b41cb8ac20dd62a495"
