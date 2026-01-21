@@ -242,13 +242,18 @@ class MALM(nn.Module):
 
 
 class Tokenizer:
-    """Tokenizer for Python code and natural language queries."""
+    """Tokenizer for Python code and natural language queries.
 
-    def __init__(self):
+    Supports a maximum vocabulary size to control model parameters.
+    Tokens beyond max_vocab_size are mapped to <UNK>.
+    """
+
+    def __init__(self, max_vocab_size: int = 50000):
         self.special = {"<PAD>": 0, "<UNK>": 1, "<BOS>": 2, "<EOS>": 3, "<SEP>": 4}
         self.token_to_id = dict(self.special)
         self.id_to_token = {v: k for k, v in self.token_to_id.items()}
         self.next_id = len(self.special)
+        self.max_vocab_size = max_vocab_size
 
         # Pre-add common Python keywords
         keywords = [
@@ -273,12 +278,21 @@ class Tokenizer:
             self.add_token(word.lower())
 
     def add_token(self, token: str) -> int:
-        """Add token to vocabulary."""
+        """Add token to vocabulary.
+
+        If vocabulary is at max capacity, returns <UNK> for new tokens.
+        """
         token = token.lower() if len(token) > 1 else token
-        if token not in self.token_to_id:
-            self.token_to_id[token] = self.next_id
-            self.id_to_token[self.next_id] = token
-            self.next_id += 1
+        if token in self.token_to_id:
+            return self.token_to_id[token]
+
+        # Check if we've hit the vocab limit
+        if self.next_id >= self.max_vocab_size:
+            return self.special["<UNK>"]
+
+        self.token_to_id[token] = self.next_id
+        self.id_to_token[self.next_id] = token
+        self.next_id += 1
         return self.token_to_id[token]
 
     def encode(self, text: str) -> List[int]:
@@ -307,6 +321,7 @@ class Tokenizer:
             json.dump({
                 "token_to_id": self.token_to_id,
                 "next_id": self.next_id,
+                "max_vocab_size": self.max_vocab_size,
             }, f)
 
     @classmethod
@@ -318,6 +333,7 @@ class Tokenizer:
         tokenizer.token_to_id = data["token_to_id"]
         tokenizer.id_to_token = {int(v): k for k, v in tokenizer.token_to_id.items()}
         tokenizer.next_id = data["next_id"]
+        tokenizer.max_vocab_size = data.get("max_vocab_size", 50000)
         tokenizer.special = {"<PAD>": 0, "<UNK>": 1, "<BOS>": 2, "<EOS>": 3, "<SEP>": 4}
         return tokenizer
 
@@ -567,6 +583,7 @@ def train(
     batch_size: int = 32,
     lr: float = 3e-4,
     checkpoint_dir: str = "checkpoints/malm",
+    max_vocab_size: int = 50000,
 ):
     """Train MALM on CodeParrot.
 
@@ -576,12 +593,13 @@ def train(
         batch_size: Batch size
         lr: Learning rate
         checkpoint_dir: Where to save checkpoints
+        max_vocab_size: Maximum vocabulary size (controls model size)
     """
     print("=" * 70)
     print("MALM: Memory-Augmented Language Model")
     print("=" * 70)
 
-    tokenizer = Tokenizer()
+    tokenizer = Tokenizer(max_vocab_size=max_vocab_size)
 
     # Load data
     print("\nExtracting functions from CodeParrot...")
@@ -641,6 +659,7 @@ def train(
     max_query_len = 20
 
     def loss_fn(model, query_ids, target_idx, key_emb, val_emb):
+        """Standard contrastive loss against all memory items."""
         cont = mx.zeros((query_ids.shape[0], 1), dtype=mx.int32) + 2
         _, _, scores = model(query_ids, key_emb, val_emb, cont)
         scores_scaled = scores / 0.07
@@ -761,6 +780,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/malm")
+    parser.add_argument("--max-vocab-size", type=int, default=50000,
+                        help="Max vocabulary size (50K = ~165M params)")
 
     args = parser.parse_args()
 
@@ -770,6 +791,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         checkpoint_dir=args.checkpoint_dir,
+        max_vocab_size=args.max_vocab_size,
     )
 
     # Final summary

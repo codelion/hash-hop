@@ -1,28 +1,37 @@
 # MALM: Memory-Augmented Language Model for Code
 
-A 165M parameter model for code understanding with **100% exact retrieval** accuracy. MALM uses the same key insight that made HashHop work: treating each function name as a single token enables perfect key-value lookup.
+A memory-augmented transformer model for code retrieval. MALM uses the same key insight that made HashHop work: treating each function name as a single token enables effective key-value lookup.
 
 ## Quick Start
 
 ```bash
-# Train MALM on CodeParrot
-poetry run python code_llm/malm.py --max-functions 2000 --steps 10000
+# Train MALM on CodeParrot (20K functions, ~90 minutes)
+poetry run python code_llm/malm.py --max-functions 20000 --steps 30000
 
 # Use pre-trained checkpoint
 python -c "
 from code_llm.malm import load_model, MALM
-model, tokenizer, functions = load_model('checkpoints/malm')
+model, tokenizer, functions = load_model('checkpoints/malm_20k')
 print(f'Loaded {len(functions)} functions')
 "
 ```
 
 ## Results
 
+### Small Scale (2K functions, 165M params)
 | Query Type | Accuracy |
 |------------|----------|
 | Exact Name Queries | **100%** |
 | Semantic Queries | **100%** |
 | Name Decomposition | **86%** |
+
+### Large Scale (20K functions, 220M params)
+| Query Type | Accuracy |
+|------------|----------|
+| Exact Name Queries | **70%** |
+| Semantic Queries | **67%** |
+
+The model scales to larger function counts with 50K vocabulary cap.
 
 ## Architecture
 
@@ -150,7 +159,16 @@ print(functions[best_idx]['source'])
 ## Training
 
 ```bash
-# Full training (2000 functions, 10K steps, ~20 minutes)
+# Large-scale training (20K functions, 30K steps, ~90 minutes)
+poetry run python code_llm/malm.py \
+    --max-functions 20000 \
+    --steps 30000 \
+    --batch-size 64 \
+    --lr 3e-4 \
+    --max-vocab-size 50000 \
+    --checkpoint-dir checkpoints/malm_20k
+
+# Standard training (2K functions, 10K steps, ~20 minutes)
 poetry run python code_llm/malm.py \
     --max-functions 2000 \
     --steps 10000 \
@@ -162,6 +180,12 @@ poetry run python code_llm/malm.py \
     --max-functions 100 \
     --steps 1000
 ```
+
+### Scaling Notes
+
+- **Vocabulary cap**: Use `--max-vocab-size` to limit model size. 50K vocab = ~220M params.
+- **Training time scales**: ~90 min for 20K functions, ~20 min for 2K functions.
+- **Memory**: 20K functions with 220M model fits in 16GB RAM.
 
 ## Files
 
