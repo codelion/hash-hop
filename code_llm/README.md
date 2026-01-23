@@ -235,3 +235,14 @@ for name, signature, docstring, score in results:
 > **MALM achieves perfect retrieval because each function name is a single token.**
 >
 > This is the same principle that makes HashHop work. When keys are single tokens, the model learns a perfect hash function through contrastive training.
+
+## Citation
+
+```bibtex
+@article{sharma2026malm,
+  title={Reverse Engineering a $500M Mystery: From HashHop to Memory-Augmented Language Models},
+  author={Sharma, Asankhaya},
+  year={2026},
+  url={https://huggingface.co/blog/codelion/reverse-engineering-magic-hashhop}
+}
+```
